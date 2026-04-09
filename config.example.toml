@@ -1,0 +1,57 @@
+# tunnix Configuration Example
+# Copy this to config.toml and customize
+
+[server]
+# Address to listen on
+listen = "0.0.0.0:8080"
+
+# Shared password for encryption
+password = "change-this-to-a-strong-password"
+
+# Path prefix for all routes (useful when sharing a host via nginx or a reverse proxy).
+# The client's server_url must include this prefix.
+# Example: path_prefix = "/tunnix"
+#   Server routes become: /tunnix/stream/{id}  and  /tunnix/send/{id}
+#   Client server_url:    "https://your-host.com/tunnix"
+# path_prefix = ""
+
+# What to serve at GET / (and GET /{prefix}).
+# GET /health always returns plain text regardless of these settings.
+# Options (pick one):
+#   root_redirect = "https://github.com/aeroxy/tunnix"  # 301 redirect
+#   root_html     = "./index.html"                               # serve local HTML file
+
+# Maximum concurrent connections (optional)
+# max_connections = 1000
+
+# Connection timeout in seconds (optional)
+# timeout = 300
+
+[client]
+# Server URL. If the server uses a path_prefix, include it here.
+# Examples:
+#   Google Cloud Shell:  "https://XXXX.cs-region.cloudshell.dev"
+#   With path prefix:    "https://your-host.com/tunnix"
+server_url = "https://XXXX.cs-region.cloudshell.dev"
+
+# Shared password for encryption (must match server)
+password = "change-this-to-a-strong-password"
+
+# Local proxy address — accepts both SOCKS5 and HTTP proxy on the same port
+local_addr = "127.0.0.1:7890"
+
+# Reconnect interval in seconds (optional)
+# reconnect_interval = 5
+
+# Custom headers for the HTTP/SSE connection
+# Get cookie values from browser DevTools → Network tab → any request to the cloudshell.dev domain
+[client.headers]
+Cookie = "CloudShellAuthorization"
+User-Agent = "Chrome"
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Optionally write logs to a file (in addition to stdout)
+# file = "./tunnix.log"
