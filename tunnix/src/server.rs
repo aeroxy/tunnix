@@ -245,27 +245,67 @@ async fn handle_send(
     match message {
         Message::Connect { conn_id, host, port } => {
             info!("[{}] CONNECT {}:{}", conn_id, host, port);
-            let crypto = state.crypto.clone();
-            let session_clone = session.clone();
+            let target = format!("{}:{}", host, port);
 
-            tokio::spawn(async move {
-                if let Err(e) =
-                    handle_tcp_connect(conn_id, &host, port, session_clone, crypto).await
-                {
-                    error!("[{}] TCP connect error: {}", conn_id, e);
-                }
-            });
-
-            // Return ACK immediately
-            match make_encrypted_response(&state.crypto, &Message::Data { conn_id, data: vec![] }) {
-                Ok(data) => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", "application/octet-stream")
-                    .body(http_body_util::Either::Left(Full::new(Bytes::from(data))))
-                    .unwrap(),
+            // Connect to target BEFORE returning ACK so the tcp_writers entry is
+            // registered by the time the client sends the first Data message.
+            // Previously the spawn raced with the ACK round-trip and early data
+            // (e.g. TLS ClientHello) was silently dropped for higher-latency targets.
+            match TcpStream::connect(&target).await {
                 Err(e) => {
-                    error!("ACK encrypt error: {}", e);
-                    ok_response("error")
+                    error!("[{}] Failed to connect to {}: {}", conn_id, target, e);
+                    let err_msg = Message::Error {
+                        conn_id: Some(conn_id),
+                        message: format!("Connect failed: {}", e),
+                    };
+                    match make_encrypted_response(&state.crypto, &err_msg) {
+                        Ok(data) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "application/octet-stream")
+                            .body(http_body_util::Either::Left(Full::new(Bytes::from(data))))
+                            .unwrap(),
+                        Err(e) => {
+                            error!("Error encrypt: {}", e);
+                            ok_response("error")
+                        }
+                    }
+                }
+                Ok(tcp_stream) => {
+                    info!("[{}] Connected to {}", conn_id, target);
+                    let (tcp_read, tcp_write) = tcp_stream.into_split();
+
+                    // Register the writer channel BEFORE returning ACK
+                    let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+                    let sse_tx = {
+                        let mut sess = session.lock().await;
+                        sess.tcp_writers.insert(conn_id, write_tx);
+                        sess.sse_tx.clone()
+                    };
+
+                    let crypto = state.crypto.clone();
+                    tokio::spawn(async move {
+                        relay_tcp_connection(
+                            conn_id, &host, port, tcp_read, tcp_write, write_rx, sse_tx,
+                            session, crypto,
+                        )
+                        .await;
+                    });
+
+                    // ACK: writer is registered, client data will be delivered immediately
+                    match make_encrypted_response(
+                        &state.crypto,
+                        &Message::Data { conn_id, data: vec![] },
+                    ) {
+                        Ok(data) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "application/octet-stream")
+                            .body(http_body_util::Either::Left(Full::new(Bytes::from(data))))
+                            .unwrap(),
+                        Err(e) => {
+                            error!("ACK encrypt error: {}", e);
+                            ok_response("error")
+                        }
+                    }
                 }
             }
         }
@@ -301,43 +341,20 @@ fn make_encrypted_response(crypto: &Crypto, msg: &Message) -> Result<Vec<u8>> {
     Ok(crypto.encrypt(&bytes)?)
 }
 
-async fn handle_tcp_connect(
+/// Relay data between an already-connected TCP stream and the tunnel SSE/POST channels.
+/// The TCP connection and writer registration must be done before calling this so that
+/// any Data messages arriving from the client are not dropped.
+async fn relay_tcp_connection(
     conn_id: u32,
     host: &str,
     port: u16,
+    mut tcp_read: tokio::net::tcp::OwnedReadHalf,
+    mut tcp_write: tokio::net::tcp::OwnedWriteHalf,
+    mut write_rx: mpsc::Receiver<Vec<u8>>,
+    sse_tx: mpsc::Sender<Vec<u8>>,
     session: Arc<Mutex<Session>>,
     crypto: Arc<Crypto>,
-) -> Result<()> {
-    let target = format!("{}:{}", host, port);
-    let tcp_stream = match TcpStream::connect(&target).await {
-        Ok(s) => {
-            info!("[{}] Connected to {}", conn_id, target);
-            s
-        }
-        Err(e) => {
-            error!("[{}] Failed to connect to {}: {}", conn_id, target, e);
-            let err_msg = Message::Error {
-                conn_id: Some(conn_id),
-                message: format!("Connect failed: {}", e),
-            };
-            let bytes = err_msg.to_bytes()?;
-            let encrypted = crypto.encrypt(&bytes)?;
-            let sess = session.lock().await;
-            let _ = sess.sse_tx.send(encrypted).await;
-            return Ok(());
-        }
-    };
-
-    let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
-
-    // Register writer channel
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(256);
-    let sse_tx = {
-        let mut sess = session.lock().await;
-        sess.tcp_writers.insert(conn_id, write_tx);
-        sess.sse_tx.clone()
-    };
-
+) {
     // TCP -> SSE (read from target, encrypt, push to SSE stream)
     let crypto_clone = crypto.clone();
     let sse_tx_clone = sse_tx.clone();
@@ -407,5 +424,4 @@ async fn handle_tcp_connect(
     }
 
     info!("[{}] Connection closed for {}:{}", conn_id, host, port);
-    Ok(())
 }
