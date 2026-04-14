@@ -31,6 +31,7 @@ struct ServerState {
     path_prefix: String,
     root_redirect: Option<String>,
     root_html: Option<String>,
+    health_body: String,
 }
 
 pub async fn run_server(
@@ -39,6 +40,7 @@ pub async fn run_server(
     path_prefix: &str,
     root_redirect: Option<String>,
     root_html: Option<String>,
+    health_body: String,
 ) -> Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
     info!("HTTP server listening on {}", listen_addr);
@@ -49,6 +51,7 @@ pub async fn run_server(
         path_prefix: path_prefix.trim_end_matches('/').to_string(),
         root_redirect,
         root_html,
+        health_body,
     });
 
     loop {
@@ -83,7 +86,7 @@ async fn handle_request(
     // /health always returns plain text, regardless of prefix (load-balancer probes)
     if method == hyper::Method::GET && path == "/health" {
         info!("Health check");
-        return Ok(ok_response("tunnix server ok\n"));
+        return Ok(ok_response(&format!("{}\n", state.health_body)));
     }
 
     // Strip configured prefix before routing
@@ -103,7 +106,7 @@ async fn handle_request(
         // Health under prefix (tunnel.rs probes {server_url}/health)
         (hyper::Method::GET, "/health") => {
             info!("Health check");
-            ok_response("tunnix server ok\n")
+            ok_response(&format!("{}\n", state.health_body))
         }
 
         // SSE stream: server -> client
@@ -160,7 +163,7 @@ async fn root_response(state: &ServerState) -> Response<BoxBody> {
             Err(e) => error!("Failed to read root_html '{}': {}", path, e),
         }
     }
-    ok_response("tunnix server ok\n")
+    ok_response(&format!("{}\n", state.health_body))
 }
 
 /// SSE endpoint: streams encrypted messages to client

@@ -43,6 +43,10 @@ pub struct ServerConfig {
     /// Local HTML file to serve at GET / (and GET /{prefix}).
     #[serde(default)]
     pub root_html: Option<String>,
+
+    /// Response body for GET /health (default: "ok").
+    #[serde(default = "default_health_response")]
+    pub health_response: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +70,10 @@ pub struct ClientConfig {
     /// Reconnect interval in seconds
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval: u64,
+
+    /// Expected response body from server /health (default: "ok"). Connection fails if mismatch.
+    #[serde(default = "default_health_expected")]
+    pub health_expected: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +104,14 @@ fn default_reconnect_interval() -> u64 {
     5
 }
 
+fn default_health_response() -> String {
+    "ok".to_string()
+}
+
+fn default_health_expected() -> String {
+    "ok".to_string()
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -110,6 +126,7 @@ impl Default for ServerConfig {
             path_prefix: String::new(),
             root_redirect: None,
             root_html: None,
+            health_response: default_health_response(),
         }
     }
 }
@@ -122,6 +139,7 @@ impl Default for ClientConfig {
             local_addr: default_local_addr(),
             headers: HashMap::new(),
             reconnect_interval: default_reconnect_interval(),
+            health_expected: default_health_expected(),
         }
     }
 }

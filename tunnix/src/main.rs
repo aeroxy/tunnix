@@ -148,6 +148,7 @@ async fn main() -> Result<()> {
                 &config.server.path_prefix,
                 config.server.root_redirect.clone(),
                 config.server.root_html.clone(),
+                config.server.health_response.clone(),
             )
             .await?;
         }
@@ -193,6 +194,7 @@ async fn main() -> Result<()> {
                 &config.client.server_url,
                 crypto,
                 &config.client.headers,
+                &config.client.health_expected,
             )
             .await?;
 

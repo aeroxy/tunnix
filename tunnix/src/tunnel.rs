@@ -30,6 +30,7 @@ impl Tunnel {
         server_url: &str,
         crypto: Arc<Crypto>,
         headers: &HashMap<String, String>,
+        health_expected: &str,
     ) -> Result<Arc<Self>> {
         // Generate session ID
         let session_id = format!("{:016x}", rand::random::<u64>());
@@ -60,7 +61,15 @@ impl Tunnel {
         let health_url = format!("{}/health", tunnel.server_base_url);
         info!("Testing connection to {}", health_url);
         let resp = tunnel.http_client.get(&health_url).send().await?;
-        info!("Server health: {} {}", resp.status(), resp.text().await?.trim());
+        let body = resp.text().await?;
+        info!("Server health: {}", body.trim());
+        if body.trim() != health_expected.trim() {
+            anyhow::bail!(
+                "Health check mismatch: expected {:?}, got {:?}",
+                health_expected.trim(),
+                body.trim()
+            );
+        }
 
         // Open SSE stream
         let tunnel_clone = tunnel.clone();

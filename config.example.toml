@@ -16,10 +16,13 @@ password = "change-this-to-a-strong-password"
 # path_prefix = ""
 
 # What to serve at GET / (and GET /{prefix}).
-# GET /health always returns plain text regardless of these settings.
+# When neither root_redirect nor root_html is set, GET / returns the same body as GET /health.
 # Options (pick one):
 #   root_redirect = "https://github.com/aeroxy/tunnix"  # 301 redirect
-#   root_html     = "./index.html"                               # serve local HTML file
+#   root_html     = "./index.html"                       # serve local HTML file
+
+# Response body for GET /health (and the default GET / fallback). Default: "ok"
+# health_response = "ok"
 
 # Maximum concurrent connections (optional)
 # max_connections = 1000
@@ -42,6 +45,9 @@ local_addr = "127.0.0.1:7890"
 
 # Reconnect interval in seconds (optional)
 # reconnect_interval = 5
+
+# Expected response body from server /health. Connection fails if response doesn't match. Default: "ok"
+# health_expected = "ok"
 
 # Custom headers for the HTTP/SSE connection
 # Get cookie values from browser DevTools → Network tab → any request to the cloudshell.dev domain
