@@ -138,8 +138,14 @@ pub async fn handle_socks5_client(mut stream: TcpStream, tunnel: Arc<Tunnel>) ->
             tunnel.unregister_connection(conn_id).await;
             return Ok(());
         }
-        Ok(_) | Err(_) => {
-            error!("[{}] Failed to send CONNECT or no ACK", conn_id);
+        other => {
+            match other {
+                Err(e) => error!("[{}] CONNECT send failed: {:#}", conn_id, e),
+                Ok(Some(unexpected)) => {
+                    error!("[{}] CONNECT unexpected ACK: {:?}", conn_id, unexpected)
+                }
+                Ok(None) => error!("[{}] CONNECT no ACK (empty response body)", conn_id),
+            }
             let reply = [
                 SOCKS5_VERSION,
                 SOCKS5_REP_GENERAL_FAILURE,

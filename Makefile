@@ -62,13 +62,14 @@ run-client:
 	cargo run --bin tunnix -- client \
 		--log-level debug
 
-# Run client in background with nohup
+# Run client in background with nohup, logging to tunnix.log
 run-client-bg:
 	@echo "Stopping any existing client..."
 	@pkill -x tunnix 2>/dev/null || true
-	@echo "Starting client in background..."
-	nohup tunnix client > /dev/null 2>&1 &
-	@echo "Client started in background"
+	@if [ -f tunnix.log ]; then mv tunnix.log tunnix.log.prev; fi
+	@echo "Starting client in background, logs -> tunnix.log"
+	RUST_LOG=tunnix=debug,tunnix_common=debug nohup tunnix client > tunnix.log 2>&1 &
+	@echo "Client started in background (tail -f tunnix.log to watch)"
 
 # Clean build artifacts
 clean:

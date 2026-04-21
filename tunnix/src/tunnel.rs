@@ -2,10 +2,13 @@ use anyhow::Result;
 use base64ct::{Base64, Encoding};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 use tunnix_common::crypto::Crypto;
 use tunnix_common::protocol::Message;
+
+const RECONNECT_WAIT: Duration = Duration::from_secs(5);
 
 /// Events received from server via SSE
 #[derive(Debug)]
@@ -22,6 +25,14 @@ pub struct Tunnel {
     crypto: Arc<Crypto>,
     http_client: reqwest::Client,
     pub response_channels: Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>,
+    /// Fired by send_message when a POST fails; tells the SSE loop to drop
+    /// its current stream and reconnect immediately instead of waiting for
+    /// the underlying TCP read to error out (which may never happen if an
+    /// upstream LB silently half-closes).
+    reconnect_signal: Notify,
+    /// Fired by the SSE loop each time the stream is freshly connected.
+    /// send_message awaits this (with timeout) after triggering a reconnect.
+    sse_ready: Notify,
 }
 
 impl Tunnel {
@@ -55,6 +66,8 @@ impl Tunnel {
             crypto,
             http_client,
             response_channels: Mutex::new(HashMap::new()),
+            reconnect_signal: Notify::new(),
+            sse_ready: Notify::new(),
         });
 
         // Test connection with health check
@@ -99,34 +112,47 @@ impl Tunnel {
         }
 
         info!("SSE stream connected");
+        // Wake any send_message calls that are blocked waiting for a fresh stream.
+        self.sse_ready.notify_waiters();
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
 
         let mut buffer = String::new();
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let text = String::from_utf8_lossy(&chunk);
-            buffer.push_str(&text);
+        loop {
+            tokio::select! {
+                chunk = stream.next() => {
+                    let chunk = match chunk {
+                        Some(c) => c?,
+                        None => break,
+                    };
+                    let text = String::from_utf8_lossy(&chunk);
+                    buffer.push_str(&text);
 
-            // Process complete SSE events (end with \n\n)
-            while let Some(pos) = buffer.find("\n\n") {
-                let event = buffer[..pos].to_string();
-                buffer = buffer[pos + 2..].to_string();
+                    // Process complete SSE events (end with \n\n)
+                    while let Some(pos) = buffer.find("\n\n") {
+                        let event = buffer[..pos].to_string();
+                        buffer = buffer[pos + 2..].to_string();
 
-                // Parse "data: <base64>" lines
-                for line in event.lines() {
-                    if let Some(data_str) = line.strip_prefix("data: ") {
-                        match Base64::decode_vec(data_str.trim()) {
-                            Ok(encrypted) => {
-                                self.handle_sse_message(&encrypted).await;
-                            }
-                            Err(e) => {
-                                warn!("Base64 decode error: {}", e);
+                        // Parse "data: <base64>" lines
+                        for line in event.lines() {
+                            if let Some(data_str) = line.strip_prefix("data: ") {
+                                match Base64::decode_vec(data_str.trim()) {
+                                    Ok(encrypted) => {
+                                        self.handle_sse_message(&encrypted).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("Base64 decode error: {}", e);
+                                    }
+                                }
                             }
                         }
                     }
+                }
+                _ = self.reconnect_signal.notified() => {
+                    warn!("SSE forced reconnect (triggered by send failure)");
+                    anyhow::bail!("forced reconnect");
                 }
             }
         }
@@ -182,16 +208,38 @@ impl Tunnel {
         }
     }
 
-    /// Send encrypted message to server via HTTP POST
+    /// Send encrypted message to server via HTTP POST.
+    ///
+    /// On first failure (HTTP error, transport error) we force the SSE loop
+    /// to reconnect and retry once. This handles the common case of the
+    /// server being restarted while the client's SSE is still half-open:
+    /// without this, the client would log "Failed to send CONNECT or no ACK"
+    /// indefinitely until manually restarted.
     pub async fn send_message(&self, msg: &Message) -> Result<Option<Vec<u8>>> {
         let bytes = msg.to_bytes()?;
         let encrypted = self.crypto.encrypt(&bytes)?;
 
+        match self.try_post(&encrypted).await {
+            Ok(v) => Ok(v),
+            Err(first_err) => {
+                warn!("send failed: {}; forcing SSE reconnect and retrying", first_err);
+                // Subscribe to sse_ready BEFORE firing the signal so we don't
+                // miss a fast reconnection.
+                let ready = self.sse_ready.notified();
+                tokio::pin!(ready);
+                self.reconnect_signal.notify_one();
+                let _ = tokio::time::timeout(RECONNECT_WAIT, ready).await;
+                self.try_post(&encrypted).await
+            }
+        }
+    }
+
+    async fn try_post(&self, encrypted: &[u8]) -> Result<Option<Vec<u8>>> {
         let url = format!("{}/send/{}", self.server_base_url, self.session_id);
         let resp = self
             .http_client
             .post(&url)
-            .body(encrypted)
+            .body(encrypted.to_vec())
             .send()
             .await?;
 

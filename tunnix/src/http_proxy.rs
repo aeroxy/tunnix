@@ -69,8 +69,14 @@ async fn handle_connect(mut stream: TcpStream, tunnel: Arc<Tunnel>, authority: &
             tunnel.unregister_connection(conn_id).await;
             return Ok(());
         }
-        Ok(_) | Err(_) => {
-            error!("[{}] CONNECT: no ACK from tunnel", conn_id);
+        other => {
+            match other {
+                Err(e) => error!("[{}] CONNECT send failed: {:#}", conn_id, e),
+                Ok(Some(unexpected)) => {
+                    error!("[{}] CONNECT unexpected ACK: {:?}", conn_id, unexpected)
+                }
+                Ok(None) => error!("[{}] CONNECT no ACK (empty response body)", conn_id),
+            }
             stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
             tunnel.unregister_connection(conn_id).await;
             return Ok(());
@@ -116,8 +122,14 @@ async fn handle_plain_http(
             tunnel.unregister_connection(conn_id).await;
             return Ok(());
         }
-        Ok(_) | Err(_) => {
-            error!("[{}] HTTP plain: no ACK from tunnel", conn_id);
+        other => {
+            match other {
+                Err(e) => error!("[{}] HTTP plain send failed: {:#}", conn_id, e),
+                Ok(Some(unexpected)) => {
+                    error!("[{}] HTTP plain unexpected ACK: {:?}", conn_id, unexpected)
+                }
+                Ok(None) => error!("[{}] HTTP plain no ACK (empty response body)", conn_id),
+            }
             stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
             tunnel.unregister_connection(conn_id).await;
             return Ok(());

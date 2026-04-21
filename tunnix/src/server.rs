@@ -143,6 +143,15 @@ fn ok_response(msg: &str) -> Response<BoxBody> {
         .unwrap()
 }
 
+fn service_unavailable_response(msg: &str) -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .body(http_body_util::Either::Left(Full::new(Bytes::from(
+            msg.to_string(),
+        ))))
+        .unwrap()
+}
+
 async fn root_response(state: &ServerState) -> Response<BoxBody> {
     if let Some(url) = &state.root_redirect {
         return Response::builder()
@@ -223,7 +232,7 @@ async fn handle_send(
             Some(s) => s.clone(),
             None => {
                 warn!("Unknown session: {}", session_id);
-                return ok_response("unknown session");
+                return service_unavailable_response("unknown session");
             }
         }
     };
