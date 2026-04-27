@@ -3,7 +3,7 @@ use base64ct::{Base64, Encoding};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
 use tunnix_common::crypto::Crypto;
 use tunnix_common::protocol::Message;
@@ -21,7 +21,7 @@ pub enum TunnelEvent {
 /// Tunnel handles communication with the server via SSE + HTTP POST
 pub struct Tunnel {
     server_base_url: String,
-    session_id: String,
+    session_id: RwLock<String>,
     crypto: Arc<Crypto>,
     http_client: reqwest::Client,
     pub response_channels: Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>,
@@ -62,7 +62,7 @@ impl Tunnel {
 
         let tunnel = Arc::new(Tunnel {
             server_base_url: server_url.trim_end_matches('/').to_string(),
-            session_id: session_id.clone(),
+            session_id: RwLock::new(session_id.clone()),
             crypto,
             http_client,
             response_channels: Mutex::new(HashMap::new()),
@@ -88,7 +88,8 @@ impl Tunnel {
         let tunnel_clone = tunnel.clone();
         tokio::spawn(async move {
             loop {
-                info!("Opening SSE stream for session {}", tunnel_clone.session_id);
+                let sid = tunnel_clone.session_id.read().await.clone();
+                info!("Opening SSE stream for session {}", sid);
                 if let Err(e) = tunnel_clone.sse_read_loop().await {
                     error!("SSE stream error: {}, reconnecting in 3s...", e);
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -104,7 +105,9 @@ impl Tunnel {
 
     /// Read SSE events and dispatch to connection handlers
     async fn sse_read_loop(&self) -> Result<()> {
-        let url = format!("{}/stream/{}", self.server_base_url, self.session_id);
+        let sid = self.session_id.read().await;
+        let url = format!("{}/stream/{}", self.server_base_url, *sid);
+        drop(sid);
         let resp = self.http_client.get(&url).send().await?;
 
         if !resp.status().is_success() {
@@ -222,6 +225,19 @@ impl Tunnel {
         match self.try_post(&encrypted).await {
             Ok(v) => Ok(v),
             Err(first_err) => {
+                let err_str = first_err.to_string();
+                if err_str.contains("unknown session") {
+                    warn!("Server lost session; generating new session ID");
+                    {
+                        let mut sid = self.session_id.write().await;
+                        *sid = format!("{:016x}", rand::random::<u64>());
+                    }
+                    {
+                        let mut channels = self.response_channels.lock().await;
+                        channels.clear();
+                    }
+                }
+
                 warn!("send failed: {}; forcing SSE reconnect and retrying", first_err);
                 // Subscribe to sse_ready BEFORE firing the signal so we don't
                 // miss a fast reconnection.
@@ -235,7 +251,9 @@ impl Tunnel {
     }
 
     async fn try_post(&self, encrypted: &[u8]) -> Result<Option<Vec<u8>>> {
-        let url = format!("{}/send/{}", self.server_base_url, self.session_id);
+        let sid = self.session_id.read().await;
+        let url = format!("{}/send/{}", self.server_base_url, *sid);
+        drop(sid);
         let resp = self
             .http_client
             .post(&url)
