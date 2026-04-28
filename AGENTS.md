@@ -33,6 +33,13 @@ Guidelines for AI agents working on this project.
 - **Session lifecycle**: SSE reconnect replaces the session on the server (new `sse_tx`/`sse_rx`). In-flight connections from the old session lose their SSE pipe — handle reconnects carefully.
 - **Multiplexing**: Multiple connections share one SSE stream, demuxed by `conn_id` (global `AtomicU32` in `tunnix/src/relay.rs`).
 
+## Development
+
+When preparing a new release:
+1. Bump the version in `Cargo.toml`.
+2. Build the release binary: `make release-all`
+3. Zip the binary inside the release folder: `zip -j target/release/tunnix_macos_arm64.zip target/release/tunnix && zip -j target/x86_64-unknown-linux-gnu/release/tunnix_linux_x86_64.zip target/x86_64-unknown-linux-gnu/release/tunnix`
+
 ## Wiki
 
 - [Architecture](wiki/architecture.md) — module map, data flow, message protocol

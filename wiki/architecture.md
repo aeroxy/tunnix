@@ -86,9 +86,11 @@ Each connection gets a unique `conn_id` used to demultiplex messages on the sing
 
 ### `tunnel.rs` — HTTP/SSE tunnel
 
-Maintains a long-lived SSE connection (`GET /stream/{session_id}`) for server-to-client messages.
+Maintains a long-lived SSE connection (`GET /stream/{session_id}`) for server-to-client messages. The SSE loop runs in a background task and uses a `tokio::select!` to interleave stream reads with a `reconnect_signal` (`Notify`), allowing `send_message` to force an immediate reconnect when a POST fails rather than waiting for the underlying TCP read to time out.
 
-Sends client-to-server messages via `POST /send/{session_id}` with an encrypted binary body.
+`session_id` is stored in an `RwLock<String>` (not a plain `String`) so concurrent callers can read it without contention, and a single writer can rotate it atomically when the server reports an unknown session (HTTP 503). All pending `response_channels` are cleared at the same time.
+
+`send_message` — tries `try_post` once; on failure it signals `reconnect_signal`, waits up to `RECONNECT_WAIT` for `sse_ready` (fired by the SSE loop on each fresh connection), then retries `try_post` once more.
 
 `send_connect()` — sends a `Connect` message and synchronously reads the **HTTP response body** as the ACK. This is distinct from the SSE stream; the ACK is the POST response, not an SSE event.
 
@@ -106,9 +108,11 @@ Three routes (all over plain HTTP/1.1 — TLS is handled by the reverse proxy / 
 |-------|---------|
 | `GET /` or `GET /health` | Liveness check (always, even with a path_prefix configured) |
 | `GET /[prefix]/stream/{session_id}` | Opens SSE stream; server pushes encrypted `TunnelEvent`s to client |
-| `POST /[prefix]/send/{session_id}` | Receives encrypted message; for `Connect`, returns encrypted ACK as response body; for `Data`/`Close`, returns empty 200 |
+| `POST /[prefix]/send/{session_id}` | Receives encrypted message; for `Connect`, returns encrypted ACK as response body; for `Data`/`Close`, returns empty 200. Returns `503 Service Unavailable` with body `"unknown session"` if the session is not found. |
 
 `path_prefix` is configured in `[server] path_prefix = "/my-path"` and is stripped from incoming paths before routing. The bare `/health` always matches regardless of prefix, so load-balancer probes work without knowing the prefix.
+
+**Session lifecycle** — `handle_stream` uses `entry().or_insert_with()` to create-or-reuse a `Session` keyed by `session_id`, then always overwrites `sse_tx` with the fresh channel. This preserves `tcp_writers` (active TCP relay tasks) across SSE reconnections. Each `relay_tcp_connection` read task fetches `sse_tx` from the session on every send rather than capturing it at spawn time, so existing relays automatically start writing to the new SSE channel after a client reconnect.
 
 The server decrypts every incoming body and encrypts every outgoing SSE event using the shared `Crypto` instance (ChaCha20-Poly1305, Argon2id key derivation).
 

@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use tunnix_common::crypto::Crypto;
 use tunnix_common::protocol::Message;
 
-const RECONNECT_WAIT: Duration = Duration::from_secs(5);
+const RECONNECT_WAIT: Duration = Duration::from_secs(10);
 
 /// Events received from server via SSE
 #[derive(Debug)]
@@ -91,6 +91,9 @@ impl Tunnel {
                 let sid = tunnel_clone.session_id.read().await.clone();
                 info!("Opening SSE stream for session {}", sid);
                 if let Err(e) = tunnel_clone.sse_read_loop().await {
+                    if e.to_string().contains("forced reconnect") {
+                        continue;
+                    }
                     error!("SSE stream error: {}, reconnecting in 3s...", e);
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
@@ -222,19 +225,21 @@ impl Tunnel {
         let bytes = msg.to_bytes()?;
         let encrypted = self.crypto.encrypt(&bytes)?;
 
+        let initial_sid = self.session_id.read().await.clone();
+
         match self.try_post(&encrypted).await {
             Ok(v) => Ok(v),
             Err(first_err) => {
                 let err_str = first_err.to_string();
                 if err_str.contains("unknown session") {
-                    warn!("Server lost session; generating new session ID");
-                    {
-                        let mut sid = self.session_id.write().await;
+                    let mut sid = self.session_id.write().await;
+                    if *sid == initial_sid {
+                        warn!("Server lost session; generating new session ID");
                         *sid = format!("{:016x}", rand::random::<u64>());
-                    }
-                    {
                         let mut channels = self.response_channels.lock().await;
                         channels.clear();
+                    } else {
+                        debug!("Session already updated by another thread, skipping generation");
                     }
                 }
 

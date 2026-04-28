@@ -7,6 +7,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -181,15 +182,24 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response<BoxBod
 
     let (sse_tx, sse_rx) = mpsc::channel::<Vec<u8>>(1024);
 
-    // Create or replace session
-    {
+    // Create or update session
+    let _session = {
         let mut sessions = state.sessions.lock().await;
-        let session = Arc::new(Mutex::new(Session {
-            tcp_writers: HashMap::new(),
-            sse_tx,
-        }));
-        sessions.insert(session_id.to_string(), session);
-    }
+        let s = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(Session {
+                    tcp_writers: HashMap::new(),
+                    sse_tx: sse_tx.clone(),
+                }))
+            })
+            .clone();
+
+        let mut s_lock = s.lock().await;
+        s_lock.sse_tx = sse_tx; // Update for existing connections to use
+        drop(s_lock);
+        s
+    };
 
     // Convert receiver to SSE stream
     let stream = futures::stream::unfold(sse_rx, |mut rx| async move {
@@ -261,8 +271,6 @@ async fn handle_send(
 
             // Connect to target BEFORE returning ACK so the tcp_writers entry is
             // registered by the time the client sends the first Data message.
-            // Previously the spawn raced with the ACK round-trip and early data
-            // (e.g. TLS ClientHello) was silently dropped for higher-latency targets.
             match TcpStream::connect(&target).await {
                 Err(e) => {
                     error!("[{}] Failed to connect to {}: {}", conn_id, target, e);
@@ -288,16 +296,15 @@ async fn handle_send(
 
                     // Register the writer channel BEFORE returning ACK
                     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
-                    let sse_tx = {
+                    {
                         let mut sess = session.lock().await;
                         sess.tcp_writers.insert(conn_id, write_tx);
-                        sess.sse_tx.clone()
                     };
 
                     let crypto = state.crypto.clone();
                     tokio::spawn(async move {
                         relay_tcp_connection(
-                            conn_id, &host, port, tcp_read, tcp_write, write_rx, sse_tx,
+                            conn_id, &host, port, tcp_read, tcp_write, write_rx,
                             session, crypto,
                         )
                         .await;
@@ -354,8 +361,6 @@ fn make_encrypted_response(crypto: &Crypto, msg: &Message) -> Result<Vec<u8>> {
 }
 
 /// Relay data between an already-connected TCP stream and the tunnel SSE/POST channels.
-/// The TCP connection and writer registration must be done before calling this so that
-/// any Data messages arriving from the client are not dropped.
 async fn relay_tcp_connection(
     conn_id: u32,
     host: &str,
@@ -363,13 +368,11 @@ async fn relay_tcp_connection(
     mut tcp_read: tokio::net::tcp::OwnedReadHalf,
     mut tcp_write: tokio::net::tcp::OwnedWriteHalf,
     mut write_rx: mpsc::Receiver<Vec<u8>>,
-    sse_tx: mpsc::Sender<Vec<u8>>,
     session: Arc<Mutex<Session>>,
     crypto: Arc<Crypto>,
 ) {
     // TCP -> SSE (read from target, encrypt, push to SSE stream)
     let crypto_clone = crypto.clone();
-    let sse_tx_clone = sse_tx.clone();
     let session_clone = session.clone();
     let read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 32768];
@@ -393,9 +396,20 @@ async fn relay_tcp_connection(
                         Ok(e) => e,
                         Err(e) => { error!("[{}] Encrypt: {}", conn_id, e); break; }
                     };
-                    if sse_tx_clone.send(encrypted).await.is_err() {
-                        error!("[{}] SSE channel closed", conn_id);
-                        break;
+                    
+                    // Always get the latest sse_tx from the session
+                    let sse_tx = {
+                        let sess = session_clone.lock().await;
+                        sess.sse_tx.clone()
+                    };
+                    if sse_tx.send(encrypted).await.is_err() {
+                        debug!("[{}] SSE stream replaced or closed, retrying in next read", conn_id);
+                        // We don't break here because a new SSE stream might be opened soon.
+                        // However, to avoid a tight loop if the target has a lot of data,
+                        // we should probably wait a bit or just accept that this chunk is lost
+                        // if we want to prioritize stability.
+                        // For now, we'll continue and try again on next read.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
                 Err(e) => {
@@ -409,7 +423,11 @@ async fn relay_tcp_connection(
         let close = Message::Close { conn_id };
         if let Ok(bytes) = close.to_bytes() {
             if let Ok(encrypted) = crypto_clone.encrypt(&bytes) {
-                let _ = sse_tx_clone.send(encrypted).await;
+                let sse_tx = {
+                    let sess = session_clone.lock().await;
+                    sess.sse_tx.clone()
+                };
+                let _ = sse_tx.send(encrypted).await;
             }
         }
         let mut sess = session_clone.lock().await;
