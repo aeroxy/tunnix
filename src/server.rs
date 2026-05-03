@@ -12,8 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
-use tunnix_common::crypto::Crypto;
-use tunnix_common::protocol::Message;
+use crate::crypto::Crypto;
+use crate::protocol::Message;
 
 type BoxBody = http_body_util::Either<
     Full<Bytes>,

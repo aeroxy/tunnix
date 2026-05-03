@@ -48,7 +48,7 @@ test:
 
 # Test crypto module
 test-crypto:
-	cargo test --package tunnix-common crypto -- --nocapture
+	cargo test crypto -- --nocapture
 
 # Run server (debug)
 run-server:
@@ -68,7 +68,7 @@ run-client-bg:
 	@pkill -x tunnix 2>/dev/null || true
 	@if [ -f tunnix.log ]; then mv tunnix.log tunnix.log.prev; fi
 	@echo "Starting client in background, logs -> tunnix.log"
-	RUST_LOG=tunnix=debug,tunnix_common=debug nohup tunnix client > tunnix.log 2>&1 &
+	RUST_LOG=tunnix=debug nohup tunnix client > tunnix.log 2>&1 &
 	@echo "Client started in background (tail -f tunnix.log to watch)"
 
 # Clean build artifacts
@@ -89,5 +89,5 @@ check: fmt clippy test
 
 # Install binary to ~/.cargo/bin
 install: release
-	cargo install --path tunnix
+	cargo install --path .
 	@echo "Installed to ~/.cargo/bin/"

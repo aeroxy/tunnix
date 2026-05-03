@@ -14,6 +14,20 @@ tunnix routes your SOCKS5 and HTTP(S) proxy traffic through a plain HTTP connect
 - **Path prefix support** — serve under a sub-path (`/foo/bar/stream/...`) to coexist with other apps on the same host
 - **Single binary** — `tunnix server` / `tunnix client`
 
+## Installation
+
+**Homebrew (macOS / Linux):**
+```bash
+brew install aeroxy/tunnix/tunnix
+```
+
+**Cargo:**
+```bash
+cargo install tunnix
+```
+
+Or download a pre-built binary from the [releases page](https://github.com/aeroxy/tunnix/releases).
+
 ## Quick Start
 
 ```bash

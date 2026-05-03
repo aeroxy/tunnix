@@ -1,18 +1,31 @@
-[workspace]
-members = ["tunnix", "common"]
-resolver = "2"
-
-[workspace.package]
-version = "0.1.5"
+[package]
+name = "tunnix"
+version = "0.2.0"
 edition = "2021"
 authors = ["Aero Wang <aero.windwalker@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/aeroxy/tunnix"
+homepage = "https://github.com/aeroxy/tunnix"
+readme = "README.md"
+keywords = ["proxy", "socks5", "tunnel", "encryption", "sse"]
+categories = ["network-programming", "command-line-utilities"]
+description = "Encrypted SOCKS5/HTTP proxy tunnel over HTTP/SSE — works through reverse proxies, Cloud Shell, Codespaces, and other HTTP-only environments."
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "QUICKSTART.md",
+    "LICENSE",
+    "config.example.toml",
+]
 
-[workspace.dependencies]
+[[bin]]
+name = "tunnix"
+path = "src/main.rs"
+
+[dependencies]
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", features = ["ring"] }
 
 # Encryption
@@ -39,6 +52,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hyper = { version = "1.6", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "stream"] }
 
 # Encoding
 base64ct = { version = "1.6", features = ["alloc"] }
@@ -46,5 +60,3 @@ base64ct = { version = "1.6", features = ["alloc"] }
 # Utilities
 futures = "0.3"
 bytes = "1.7"
-url = "2.5"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "stream"] }

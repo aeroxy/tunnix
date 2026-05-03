@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info};
-use tunnix_common::protocol::Message;
+use crate::protocol::Message;
 
 /// SOCKS5 constants
 const SOCKS5_VERSION: u8 = 0x05;

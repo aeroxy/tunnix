@@ -1,7 +1,3 @@
-# AGENTS.md
-
-Guidelines for AI agents working on this project.
-
 ## Communication Style
 
 - Explain the *why* (root cause, design intent) before proposing a fix.
@@ -25,13 +21,13 @@ Guidelines for AI agents working on this project.
 
 ## Architecture Notes
 
-- **Single crate**: `tunnix/src/` contains all server and client code. `common/` is a shared library (`tunnix-common`).
+- **Single crate**: `src/` contains all server and client code (crypto, protocol, config, server, client, dual-protocol listener).
 - **Transport**: HTTP/SSE. Client uploads via `POST /[prefix]/send/{session_id}`, downloads via SSE on `GET /[prefix]/stream/{session_id}`.
-- **Path prefix**: The server strips `path_prefix` from incoming paths before routing. Bare `/` and `/health` always match regardless of prefix (load-balancer probes). See `tunnix/src/server.rs`.
+- **Path prefix**: The server strips `path_prefix` from incoming paths before routing. Bare `/` and `/health` always match regardless of prefix (load-balancer probes). See `src/server.rs`.
 - **CONNECT ACK**: The server returns the ACK as the HTTP response body of the POST to `/send/{session_id}`. The client must decrypt the response body using `send_connect()`.
-- **Dual-protocol listener**: The client listens on one port for both SOCKS5 and HTTP proxy. Protocol is detected by peeking the first byte (`0x05` = SOCKS5, ASCII letter = HTTP). See `tunnix/src/proxy.rs`.
+- **Dual-protocol listener**: The client listens on one port for both SOCKS5 and HTTP proxy. Protocol is detected by peeking the first byte (`0x05` = SOCKS5, ASCII letter = HTTP). See `src/proxy.rs`.
 - **Session lifecycle**: SSE reconnect replaces the session on the server (new `sse_tx`/`sse_rx`). In-flight connections from the old session lose their SSE pipe — handle reconnects carefully.
-- **Multiplexing**: Multiple connections share one SSE stream, demuxed by `conn_id` (global `AtomicU32` in `tunnix/src/relay.rs`).
+- **Multiplexing**: Multiple connections share one SSE stream, demuxed by `conn_id` (global `AtomicU32` in `src/relay.rs`).
 
 ## Development
 
@@ -39,6 +35,8 @@ When preparing a new release:
 1. Bump the version in `Cargo.toml`.
 2. Build the release binary: `make release-all`
 3. Zip the binary inside the release folder: `zip -j target/release/tunnix_macos_arm64.zip target/release/tunnix && zip -j target/x86_64-unknown-linux-gnu/release/tunnix_linux_x86_64.zip target/x86_64-unknown-linux-gnu/release/tunnix`
+4. Calculate the SHA256: `shasum -a 256 target/release/tunnix_macos_arm64.zip target/x86_64-unknown-linux-gnu/release/tunnix_linux_x86_64.zip`
+5. Update `Formula/tunnix.rb` with the new version, URLs, and SHA256s.
 
 ## Wiki
 

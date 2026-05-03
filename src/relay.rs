@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
-use tunnix_common::protocol::Message;
+use crate::protocol::Message;
 
 static CONN_COUNTER: AtomicU32 = AtomicU32::new(1);
 

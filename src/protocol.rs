@@ -34,32 +34,6 @@ pub enum Message {
     },
 }
 
-/// Frame format for encrypted messages
-///
-/// Wire format:
-/// [4 bytes: payload length][12 bytes: nonce][N bytes: encrypted payload][16 bytes: auth tag]
-#[derive(Debug)]
-pub struct Frame {
-    pub payload: Vec<u8>,
-}
-
-impl Frame {
-    /// Create a new frame from serialized message
-    pub fn new(payload: Vec<u8>) -> Self {
-        Self { payload }
-    }
-
-    /// Get payload as slice
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    /// Consume frame and return payload
-    pub fn into_payload(self) -> Vec<u8> {
-        self.payload
-    }
-}
-
 impl Message {
     /// Serialize message to bytes using bincode
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {

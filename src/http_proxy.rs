@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info};
-use tunnix_common::protocol::Message;
+use crate::protocol::Message;
 
 pub async fn handle_http_proxy_client(mut stream: TcpStream, tunnel: Arc<Tunnel>) -> Result<()> {
     // Read headers byte-by-byte until \r\n\r\n.

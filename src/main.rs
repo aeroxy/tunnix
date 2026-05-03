@@ -1,4 +1,7 @@
+mod config;
+mod crypto;
 mod http_proxy;
+mod protocol;
 mod proxy;
 mod relay;
 mod server;
@@ -11,8 +14,9 @@ use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tunnix_common::config::Config;
-use tunnix_common::crypto::Crypto;
+
+use crate::config::Config;
+use crate::crypto::Crypto;
 
 #[derive(Parser, Debug)]
 #[command(name = "tunnix", version, about = "encrypted proxy tunnel over HTTP/SSE")]

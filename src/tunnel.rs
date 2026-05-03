@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
-use tunnix_common::crypto::Crypto;
-use tunnix_common::protocol::Message;
+use crate::crypto::Crypto;
+use crate::protocol::Message;
 
 const RECONNECT_WAIT: Duration = Duration::from_secs(10);
 

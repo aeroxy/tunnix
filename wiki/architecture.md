@@ -120,7 +120,7 @@ The server decrypts every incoming body and encrypts every outgoing SSE event us
 
 ## Encryption
 
-`common/src/crypto.rs` — `Crypto` struct:
+`src/crypto.rs` — `Crypto` struct:
 - Key derivation: Argon2id from the shared password + a fixed salt.
 - Encryption: ChaCha20-Poly1305 with a random 12-byte nonce prepended to each ciphertext.
 - Each `Message` is serialized with `Message::to_bytes()`, encrypted, then sent on the wire.
@@ -129,7 +129,7 @@ The server decrypts every incoming body and encrypts every outgoing SSE event us
 
 ## Message protocol
 
-`common/src/protocol.rs` — `Message` enum:
+`src/protocol.rs` — `Message` enum:
 
 | Variant | Direction | Purpose |
 |---------|-----------|---------|
