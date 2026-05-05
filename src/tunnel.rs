@@ -1,12 +1,14 @@
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use base64ct::{Base64, Encoding};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 use crate::crypto::Crypto;
 use crate::protocol::Message;
+use crate::reload::{build_http_client, HotClientConfig};
 
 const RECONNECT_WAIT: Duration = Duration::from_secs(10);
 
@@ -21,17 +23,10 @@ pub enum TunnelEvent {
 /// Tunnel handles communication with the server via SSE + HTTP POST
 pub struct Tunnel {
     server_base_url: String,
-    session_id: RwLock<String>,
-    crypto: Arc<Crypto>,
-    http_client: reqwest::Client,
-    pub response_channels: Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>,
-    /// Fired by send_message when a POST fails; tells the SSE loop to drop
-    /// its current stream and reconnect immediately instead of waiting for
-    /// the underlying TCP read to error out (which may never happen if an
-    /// upstream LB silently half-closes).
-    reconnect_signal: Notify,
-    /// Fired by the SSE loop each time the stream is freshly connected.
-    /// send_message awaits this (with timeout) after triggering a reconnect.
+    pub session_id: Arc<tokio::sync::RwLock<String>>,
+    pub hot: Arc<ArcSwap<HotClientConfig>>,
+    pub response_channels: Arc<Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>>,
+    pub reconnect_signal: Arc<Notify>,
     sse_ready: Notify,
 }
 
@@ -43,37 +38,29 @@ impl Tunnel {
         headers: &HashMap<String, String>,
         health_expected: &str,
     ) -> Result<Arc<Self>> {
-        // Generate session ID
         let session_id = format!("{:016x}", rand::random::<u64>());
 
-        // Build HTTP client with custom headers
-        let mut default_headers = reqwest::header::HeaderMap::new();
-        for (key, value) in headers {
-            default_headers.insert(
-                reqwest::header::HeaderName::from_bytes(key.as_bytes())?,
-                reqwest::header::HeaderValue::from_str(value)?,
-            );
-        }
+        let http_client = build_http_client(headers)?;
 
-        let http_client = reqwest::Client::builder()
-            .default_headers(default_headers)
-            .danger_accept_invalid_certs(true)
-            .build()?;
+        let hot = Arc::new(ArcSwap::from_pointee(HotClientConfig {
+            crypto,
+            http_client,
+        }));
 
         let tunnel = Arc::new(Tunnel {
             server_base_url: server_url.trim_end_matches('/').to_string(),
-            session_id: RwLock::new(session_id.clone()),
-            crypto,
-            http_client,
-            response_channels: Mutex::new(HashMap::new()),
-            reconnect_signal: Notify::new(),
+            session_id: Arc::new(tokio::sync::RwLock::new(session_id.clone())),
+            hot,
+            response_channels: Arc::new(Mutex::new(HashMap::new())),
+            reconnect_signal: Arc::new(Notify::new()),
             sse_ready: Notify::new(),
         });
 
         // Test connection with health check
         let health_url = format!("{}/health", tunnel.server_base_url);
         info!("Testing connection to {}", health_url);
-        let resp = tunnel.http_client.get(&health_url).send().await?;
+        let hot_snap = tunnel.hot.load();
+        let resp = hot_snap.http_client.get(&health_url).send().await?;
         let body = resp.text().await?;
         info!("Server health: {}", body.trim());
         if body.trim() != health_expected.trim() {
@@ -111,14 +98,14 @@ impl Tunnel {
         let sid = self.session_id.read().await;
         let url = format!("{}/stream/{}", self.server_base_url, *sid);
         drop(sid);
-        let resp = self.http_client.get(&url).send().await?;
+        let hot = self.hot.load();
+        let resp = hot.http_client.get(&url).send().await?;
 
         if !resp.status().is_success() {
             anyhow::bail!("SSE stream failed: {}", resp.status());
         }
 
         info!("SSE stream connected");
-        // Wake any send_message calls that are blocked waiting for a fresh stream.
         self.sse_ready.notify_waiters();
 
         use futures::StreamExt;
@@ -136,12 +123,10 @@ impl Tunnel {
                     let text = String::from_utf8_lossy(&chunk);
                     buffer.push_str(&text);
 
-                    // Process complete SSE events (end with \n\n)
                     while let Some(pos) = buffer.find("\n\n") {
                         let event = buffer[..pos].to_string();
                         buffer = buffer[pos + 2..].to_string();
 
-                        // Parse "data: <base64>" lines
                         for line in event.lines() {
                             if let Some(data_str) = line.strip_prefix("data: ") {
                                 match Base64::decode_vec(data_str.trim()) {
@@ -169,7 +154,8 @@ impl Tunnel {
 
     /// Process a decrypted message from SSE
     async fn handle_sse_message(&self, encrypted: &[u8]) {
-        let plaintext = match self.crypto.decrypt(encrypted) {
+        let hot = self.hot.load();
+        let plaintext = match hot.crypto.decrypt(encrypted) {
             Ok(p) => p,
             Err(e) => {
                 error!("Decrypt failed: {}", e);
@@ -214,16 +200,10 @@ impl Tunnel {
         }
     }
 
-    /// Send encrypted message to server via HTTP POST.
-    ///
-    /// On first failure (HTTP error, transport error) we force the SSE loop
-    /// to reconnect and retry once. This handles the common case of the
-    /// server being restarted while the client's SSE is still half-open:
-    /// without this, the client would log "Failed to send CONNECT or no ACK"
-    /// indefinitely until manually restarted.
     pub async fn send_message(&self, msg: &Message) -> Result<Option<Vec<u8>>> {
+        let hot = self.hot.load();
         let bytes = msg.to_bytes()?;
-        let encrypted = self.crypto.encrypt(&bytes)?;
+        let encrypted = hot.crypto.encrypt(&bytes)?;
 
         let initial_sid = self.session_id.read().await.clone();
 
@@ -244,8 +224,6 @@ impl Tunnel {
                 }
 
                 warn!("send failed: {}; forcing SSE reconnect and retrying", first_err);
-                // Subscribe to sse_ready BEFORE firing the signal so we don't
-                // miss a fast reconnection.
                 let ready = self.sse_ready.notified();
                 tokio::pin!(ready);
                 self.reconnect_signal.notify_one();
@@ -259,7 +237,8 @@ impl Tunnel {
         let sid = self.session_id.read().await;
         let url = format!("{}/send/{}", self.server_base_url, *sid);
         drop(sid);
-        let resp = self
+        let hot = self.hot.load();
+        let resp = hot
             .http_client
             .post(&url)
             .body(encrypted.to_vec())
@@ -284,7 +263,8 @@ impl Tunnel {
     pub async fn send_connect(&self, msg: &Message) -> Result<Option<Message>> {
         match self.send_message(msg).await? {
             Some(data) if !data.is_empty() => {
-                let plaintext = self.crypto.decrypt(&data)?;
+                let hot = self.hot.load();
+                let plaintext = hot.crypto.decrypt(&data)?;
                 let response = Message::from_bytes(&plaintext)?;
                 Ok(Some(response))
             }

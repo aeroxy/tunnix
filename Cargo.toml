@@ -1,6 +1,6 @@
 [package]
 name = "tunnix"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Aero Wang <aero.windwalker@gmail.com>"]
 license = "MIT"
@@ -60,3 +60,4 @@ base64ct = { version = "1.6", features = ["alloc"] }
 # Utilities
 futures = "0.3"
 bytes = "1.7"
+arc-swap = "1"

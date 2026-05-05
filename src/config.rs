@@ -14,7 +14,7 @@ pub struct Config {
     pub logging: LoggingConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerConfig {
     /// Address to listen on (e.g., "0.0.0.0:8080")
     #[serde(default = "default_listen_addr")]
@@ -49,7 +49,7 @@ pub struct ServerConfig {
     pub health_response: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClientConfig {
     /// WebSocket server URL (e.g., "wss://example.com")
     #[serde(default)]
@@ -76,7 +76,7 @@ pub struct ClientConfig {
     pub health_expected: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LoggingConfig {
     /// Log level: trace, debug, info, warn, error
     #[serde(default = "default_log_level")]

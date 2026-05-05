@@ -66,7 +66,7 @@ run-client:
 run-client-bg:
 	@echo "Stopping any existing client..."
 	@pkill -x tunnix 2>/dev/null || true
-	@if [ -f tunnix.log ]; then mv tunnix.log tunnix.log.prev; fi
+	@if [ -f tunnix.log ]; then mv tunnix.log tunnix.prev.log; fi
 	@echo "Starting client in background, logs -> tunnix.log"
 	RUST_LOG=tunnix=debug nohup tunnix client > tunnix.log 2>&1 &
 	@echo "Client started in background (tail -f tunnix.log to watch)"

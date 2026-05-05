@@ -4,6 +4,7 @@ mod http_proxy;
 mod protocol;
 mod proxy;
 mod relay;
+mod reload;
 mod server;
 mod socks5;
 mod tunnel;
@@ -17,6 +18,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::Config;
 use crate::crypto::Crypto;
+use crate::reload::{CliOverrides, HotServerConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "tunnix", version, about = "encrypted proxy tunnel over HTTP/SSE")]
@@ -75,6 +77,19 @@ struct ClientArgs {
     cookie: Option<String>,
 }
 
+fn resolve_config_path(explicit: &Option<String>) -> Option<String> {
+    match explicit {
+        Some(p) => Some(p.clone()),
+        None => {
+            if std::path::Path::new("config.toml").exists() {
+                Some("config.toml".to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -120,8 +135,16 @@ async fn main() -> Result<()> {
         registry.init();
     }
 
+    let config_path = resolve_config_path(&args.config);
+
     match args.command {
         Command::Server(sa) => {
+            let cli_overrides = Arc::new(CliOverrides {
+                server_password: sa.password.is_some(),
+                client_password: false,
+                client_headers: false,
+            });
+
             if let Some(listen) = sa.listen {
                 config.server.listen = listen;
             }
@@ -146,18 +169,30 @@ async fn main() -> Result<()> {
             let crypto = Arc::new(Crypto::new(&config.server.password)?);
             info!("Encryption initialized");
 
+            let hot = HotServerConfig {
+                crypto,
+                path_prefix: config.server.path_prefix.trim_end_matches('/').to_string(),
+                root_redirect: config.server.root_redirect.clone(),
+                root_html: config.server.root_html.clone(),
+                health_body: config.server.health_response.clone(),
+            };
+
             server::run_server(
                 &config.server.listen,
-                crypto,
-                &config.server.path_prefix,
-                config.server.root_redirect.clone(),
-                config.server.root_html.clone(),
-                config.server.health_response.clone(),
+                hot,
+                config_path,
+                cli_overrides,
             )
             .await?;
         }
 
         Command::Client(ca) => {
+            let cli_overrides = Arc::new(CliOverrides {
+                server_password: false,
+                client_password: ca.password.is_some(),
+                client_headers: ca.cookie.is_some(),
+            });
+
             if let Some(server) = ca.server {
                 config.client.server_url = server;
             }
@@ -203,6 +238,20 @@ async fn main() -> Result<()> {
             .await?;
 
             info!("Tunnel established");
+
+            if let Some(path) = config_path {
+                let hot = tun.hot.clone();
+                let reconnect = tun.reconnect_signal.clone();
+                let session_id = tun.session_id.clone();
+                let channels = tun.response_channels.clone();
+                let overrides = cli_overrides.clone();
+                tokio::spawn(async move {
+                    reload::config_watcher_client(
+                        path, hot, reconnect, session_id, channels, overrides,
+                    )
+                    .await;
+                });
+            }
 
             proxy::run_proxy(&config.client.local_addr, tun).await?;
         }

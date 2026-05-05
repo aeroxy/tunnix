@@ -18,7 +18,8 @@ tunnix routes your SOCKS5 and HTTP(S) proxy traffic through a plain HTTP connect
 
 **Homebrew (macOS / Linux):**
 ```bash
-brew install aeroxy/tunnix/tunnix
+brew tap aeroxy/tunnix https://github.com/aeroxy/tunnix
+brew install tunnix
 ```
 
 **Cargo:**
@@ -179,6 +180,8 @@ tunnix client --config config.toml
 ```
 
 CLI flags always override config file values. The password can also be supplied via the `TUNNIX_PASSWORD` environment variable.
+
+Changes to `config.toml` are picked up automatically every few seconds — no restart needed. Hot-reloadable fields: `password`, `headers`, `path_prefix`, `root_redirect`, `root_html`, `health_response`. Fields that require a restart: `listen`, `local_addr`, `server_url`, `logging.level`. CLI overrides are never clobbered by file changes.
 
 ## Building
 

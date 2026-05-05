@@ -1,4 +1,5 @@
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
@@ -14,6 +15,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 use crate::crypto::Crypto;
 use crate::protocol::Message;
+use crate::reload::{CliOverrides, HotServerConfig};
 
 type BoxBody = http_body_util::Either<
     Full<Bytes>,
@@ -27,32 +29,32 @@ struct Session {
 }
 
 struct ServerState {
-    crypto: Arc<Crypto>,
+    hot: Arc<ArcSwap<HotServerConfig>>,
     sessions: Mutex<HashMap<String, Arc<Mutex<Session>>>>,
-    path_prefix: String,
-    root_redirect: Option<String>,
-    root_html: Option<String>,
-    health_body: String,
 }
 
 pub async fn run_server(
     listen_addr: &str,
-    crypto: Arc<Crypto>,
-    path_prefix: &str,
-    root_redirect: Option<String>,
-    root_html: Option<String>,
-    health_body: String,
+    initial_hot: HotServerConfig,
+    config_path: Option<String>,
+    cli_overrides: Arc<CliOverrides>,
 ) -> Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
     info!("HTTP server listening on {}", listen_addr);
 
+    let hot = Arc::new(ArcSwap::from_pointee(initial_hot));
+
+    if let Some(path) = config_path {
+        let hot_clone = hot.clone();
+        let overrides = cli_overrides.clone();
+        tokio::spawn(async move {
+            crate::reload::config_watcher_server(path, hot_clone, overrides).await;
+        });
+    }
+
     let state = Arc::new(ServerState {
-        crypto,
+        hot,
         sessions: Mutex::new(HashMap::new()),
-        path_prefix: path_prefix.trim_end_matches('/').to_string(),
-        root_redirect,
-        root_html,
-        health_body,
     });
 
     loop {
@@ -84,39 +86,37 @@ async fn handle_request(
     let method = req.method().clone();
     debug!("{} {}", method, path);
 
+    let hot = state.hot.load();
+
     // /health always returns plain text, regardless of prefix (load-balancer probes)
     if method == hyper::Method::GET && path == "/health" {
         info!("Health check");
-        return Ok(ok_response(&format!("{}\n", state.health_body)));
+        return Ok(ok_response(&format!("{}\n", hot.health_body)));
     }
 
     // Strip configured prefix before routing
-    let effective_path: &str = if state.path_prefix.is_empty() {
+    let effective_path: &str = if hot.path_prefix.is_empty() {
         &path
     } else {
-        match path.strip_prefix(state.path_prefix.as_str()) {
+        match path.strip_prefix(hot.path_prefix.as_str()) {
             Some(rest) => rest,
             None => return Ok(ok_response("not found")),
         }
     };
 
     let response = match (method, effective_path) {
-        // Root endpoint: configurable (redirect, HTML, or plain text)
-        (hyper::Method::GET, "" | "/") => root_response(&state).await,
+        (hyper::Method::GET, "" | "/") => root_response(&hot).await,
 
-        // Health under prefix (tunnel.rs probes {server_url}/health)
         (hyper::Method::GET, "/health") => {
             info!("Health check");
-            ok_response(&format!("{}\n", state.health_body))
+            ok_response(&format!("{}\n", hot.health_body))
         }
 
-        // SSE stream: server -> client
         (hyper::Method::GET, p) if p.starts_with("/stream/") => {
             let session_id = p.trim_start_matches("/stream/").to_string();
             handle_stream(&session_id, &state).await
         }
 
-        // Client -> server messages
         (hyper::Method::POST, p) if p.starts_with("/send/") => {
             let session_id = p.trim_start_matches("/send/").to_string();
             let body = match req.collect().await {
@@ -153,15 +153,15 @@ fn service_unavailable_response(msg: &str) -> Response<BoxBody> {
         .unwrap()
 }
 
-async fn root_response(state: &ServerState) -> Response<BoxBody> {
-    if let Some(url) = &state.root_redirect {
+async fn root_response(hot: &HotServerConfig) -> Response<BoxBody> {
+    if let Some(url) = &hot.root_redirect {
         return Response::builder()
             .status(StatusCode::MOVED_PERMANENTLY)
             .header("Location", url.as_str())
             .body(http_body_util::Either::Left(Full::new(Bytes::new())))
             .unwrap();
     }
-    if let Some(path) = &state.root_html {
+    if let Some(path) = &hot.root_html {
         match tokio::fs::read_to_string(path).await {
             Ok(content) => {
                 return Response::builder()
@@ -173,7 +173,7 @@ async fn root_response(state: &ServerState) -> Response<BoxBody> {
             Err(e) => error!("Failed to read root_html '{}': {}", path, e),
         }
     }
-    ok_response(&format!("{}\n", state.health_body))
+    ok_response(&format!("{}\n", hot.health_body))
 }
 
 /// SSE endpoint: streams encrypted messages to client
@@ -182,7 +182,6 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response<BoxBod
 
     let (sse_tx, sse_rx) = mpsc::channel::<Vec<u8>>(1024);
 
-    // Create or update session
     let _session = {
         let mut sessions = state.sessions.lock().await;
         let s = sessions
@@ -196,16 +195,14 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response<BoxBod
             .clone();
 
         let mut s_lock = s.lock().await;
-        s_lock.sse_tx = sse_tx; // Update for existing connections to use
+        s_lock.sse_tx = sse_tx;
         drop(s_lock);
         s
     };
 
-    // Convert receiver to SSE stream
     let stream = futures::stream::unfold(sse_rx, |mut rx| async move {
         match rx.recv().await {
             Some(data) => {
-                // SSE format: base64 encode binary data
                 use base64ct::{Base64, Encoding};
                 let encoded = Base64::encode_string(&data);
                 let event = format!("data: {}\n\n", encoded);
@@ -236,6 +233,8 @@ async fn handle_send(
     body: &Bytes,
     state: &ServerState,
 ) -> Response<BoxBody> {
+    let hot = state.hot.load();
+
     let session = {
         let sessions = state.sessions.lock().await;
         match sessions.get(session_id) {
@@ -247,8 +246,7 @@ async fn handle_send(
         }
     };
 
-    // Decrypt
-    let plaintext = match state.crypto.decrypt(body) {
+    let plaintext = match hot.crypto.decrypt(body) {
         Ok(p) => p,
         Err(e) => {
             error!("Decrypt failed: {}", e);
@@ -269,8 +267,6 @@ async fn handle_send(
             info!("[{}] CONNECT {}:{}", conn_id, host, port);
             let target = format!("{}:{}", host, port);
 
-            // Connect to target BEFORE returning ACK so the tcp_writers entry is
-            // registered by the time the client sends the first Data message.
             match TcpStream::connect(&target).await {
                 Err(e) => {
                     error!("[{}] Failed to connect to {}: {}", conn_id, target, e);
@@ -278,7 +274,7 @@ async fn handle_send(
                         conn_id: Some(conn_id),
                         message: format!("Connect failed: {}", e),
                     };
-                    match make_encrypted_response(&state.crypto, &err_msg) {
+                    match make_encrypted_response(&hot.crypto, &err_msg) {
                         Ok(data) => Response::builder()
                             .status(StatusCode::OK)
                             .header("Content-Type", "application/octet-stream")
@@ -294,14 +290,13 @@ async fn handle_send(
                     info!("[{}] Connected to {}", conn_id, target);
                     let (tcp_read, tcp_write) = tcp_stream.into_split();
 
-                    // Register the writer channel BEFORE returning ACK
                     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
                     {
                         let mut sess = session.lock().await;
                         sess.tcp_writers.insert(conn_id, write_tx);
                     };
 
-                    let crypto = state.crypto.clone();
+                    let crypto = hot.crypto.clone();
                     tokio::spawn(async move {
                         relay_tcp_connection(
                             conn_id, &host, port, tcp_read, tcp_write, write_rx,
@@ -310,9 +305,8 @@ async fn handle_send(
                         .await;
                     });
 
-                    // ACK: writer is registered, client data will be delivered immediately
                     match make_encrypted_response(
-                        &state.crypto,
+                        &hot.crypto,
                         &Message::Data { conn_id, data: vec![] },
                     ) {
                         Ok(data) => Response::builder()
@@ -343,7 +337,7 @@ async fn handle_send(
             ok_response("")
         }
         Message::Ping => {
-            match make_encrypted_response(&state.crypto, &Message::Pong) {
+            match make_encrypted_response(&hot.crypto, &Message::Pong) {
                 Ok(data) => Response::builder()
                     .status(StatusCode::OK)
                     .body(http_body_util::Either::Left(Full::new(Bytes::from(data))))
@@ -371,7 +365,6 @@ async fn relay_tcp_connection(
     session: Arc<Mutex<Session>>,
     crypto: Arc<Crypto>,
 ) {
-    // TCP -> SSE (read from target, encrypt, push to SSE stream)
     let crypto_clone = crypto.clone();
     let session_clone = session.clone();
     let read_task = tokio::spawn(async move {
@@ -396,19 +389,13 @@ async fn relay_tcp_connection(
                         Ok(e) => e,
                         Err(e) => { error!("[{}] Encrypt: {}", conn_id, e); break; }
                     };
-                    
-                    // Always get the latest sse_tx from the session
+
                     let sse_tx = {
                         let sess = session_clone.lock().await;
                         sess.sse_tx.clone()
                     };
                     if sse_tx.send(encrypted).await.is_err() {
                         debug!("[{}] SSE stream replaced or closed, retrying in next read", conn_id);
-                        // We don't break here because a new SSE stream might be opened soon.
-                        // However, to avoid a tight loop if the target has a lot of data,
-                        // we should probably wait a bit or just accept that this chunk is lost
-                        // if we want to prioritize stability.
-                        // For now, we'll continue and try again on next read.
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
@@ -419,7 +406,6 @@ async fn relay_tcp_connection(
             }
         }
 
-        // Send close via SSE
         let close = Message::Close { conn_id };
         if let Ok(bytes) = close.to_bytes() {
             if let Ok(encrypted) = crypto_clone.encrypt(&bytes) {
@@ -434,7 +420,6 @@ async fn relay_tcp_connection(
         sess.tcp_writers.remove(&conn_id);
     });
 
-    // Client -> TCP (receive from channel, write to target)
     let write_task = tokio::spawn(async move {
         while let Some(data) = write_rx.recv().await {
             if data.is_empty() {

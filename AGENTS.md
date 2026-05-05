@@ -42,3 +42,4 @@ When preparing a new release:
 
 - [Architecture](wiki/architecture.md) — module map, data flow, message protocol
 - [Enriched Context](wiki/enriched-context.md) — design decisions, non-obvious constraints, gotchas
+- [Hot Reload](wiki/hot-reload.md) — runtime config reload via ArcSwap, CLI override protection, field matrix
