@@ -25,6 +25,7 @@ pub struct HotServerConfig {
 pub struct HotClientConfig {
     pub crypto: Arc<Crypto>,
     pub http_client: reqwest::Client,
+    pub server_base_url: String,
 }
 
 pub fn build_http_client(headers: &HashMap<String, String>) -> anyhow::Result<reqwest::Client> {
@@ -259,6 +260,12 @@ pub async fn config_watcher_client(
             None
         };
 
+        let new_server_url = cc.server_url.trim_end_matches('/').to_string();
+        if new_server_url != current.server_base_url {
+            changed.push("server_url");
+            needs_reconnect = true;
+        }
+
         if changed.is_empty() {
             continue;
         }
@@ -268,8 +275,13 @@ pub async fn config_watcher_client(
 
         let crypto = new_crypto.unwrap_or_else(|| current.crypto.clone());
         let http_client = new_client.unwrap_or_else(|| current.http_client.clone());
+        let server_base_url = if new_server_url != current.server_base_url {
+            new_server_url
+        } else {
+            current.server_base_url.clone()
+        };
 
-        hot.store(Arc::new(HotClientConfig { crypto, http_client }));
+        hot.store(Arc::new(HotClientConfig { crypto, http_client, server_base_url }));
         info!("Config reloaded: {}", changed.join(", "));
 
         if needs_reconnect {

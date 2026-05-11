@@ -22,7 +22,6 @@ pub enum TunnelEvent {
 
 /// Tunnel handles communication with the server via SSE + HTTP POST
 pub struct Tunnel {
-    server_base_url: String,
     pub session_id: Arc<tokio::sync::RwLock<String>>,
     pub hot: Arc<ArcSwap<HotClientConfig>>,
     pub response_channels: Arc<Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>>,
@@ -42,13 +41,14 @@ impl Tunnel {
 
         let http_client = build_http_client(headers)?;
 
+        let server_base_url = server_url.trim_end_matches('/').to_string();
         let hot = Arc::new(ArcSwap::from_pointee(HotClientConfig {
             crypto,
             http_client,
+            server_base_url: server_base_url.clone(),
         }));
 
         let tunnel = Arc::new(Tunnel {
-            server_base_url: server_url.trim_end_matches('/').to_string(),
             session_id: Arc::new(tokio::sync::RwLock::new(session_id.clone())),
             hot,
             response_channels: Arc::new(Mutex::new(HashMap::new())),
@@ -57,7 +57,7 @@ impl Tunnel {
         });
 
         // Test connection with health check
-        let health_url = format!("{}/health", tunnel.server_base_url);
+        let health_url = format!("{}/health", server_base_url);
         info!("Testing connection to {}", health_url);
         let hot_snap = tunnel.hot.load();
         let resp = hot_snap.http_client.get(&health_url).send().await?;
@@ -75,8 +75,6 @@ impl Tunnel {
         let tunnel_clone = tunnel.clone();
         tokio::spawn(async move {
             loop {
-                let sid = tunnel_clone.session_id.read().await.clone();
-                info!("Opening SSE stream for session {}", sid);
                 if let Err(e) = tunnel_clone.sse_read_loop().await {
                     if e.to_string().contains("forced reconnect") {
                         continue;
@@ -95,10 +93,11 @@ impl Tunnel {
 
     /// Read SSE events and dispatch to connection handlers
     async fn sse_read_loop(&self) -> Result<()> {
-        let sid = self.session_id.read().await;
-        let url = format!("{}/stream/{}", self.server_base_url, *sid);
-        drop(sid);
         let hot = self.hot.load();
+        let sid = self.session_id.read().await;
+        let url = format!("{}/stream/{}", hot.server_base_url, *sid);
+        info!("Opening SSE stream for session {} at {}", sid, hot.server_base_url);
+        drop(sid);
         let resp = hot.http_client.get(&url).send().await?;
 
         if !resp.status().is_success() {
@@ -234,10 +233,10 @@ impl Tunnel {
     }
 
     async fn try_post(&self, encrypted: &[u8]) -> Result<Option<Vec<u8>>> {
-        let sid = self.session_id.read().await;
-        let url = format!("{}/send/{}", self.server_base_url, *sid);
-        drop(sid);
         let hot = self.hot.load();
+        let sid = self.session_id.read().await;
+        let url = format!("{}/send/{}", hot.server_base_url, *sid);
+        drop(sid);
         let resp = hot
             .http_client
             .post(&url)
