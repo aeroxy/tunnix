@@ -1,4 +1,4 @@
-.PHONY: build test clean run-server run-client run-client-bg release release-linux release-all help
+.PHONY: build test clean run-server run-client run-client-bg release release-linux release-all help bump-patch bump-minor bump-major update-formula
 
 LINUX_TARGET = x86_64-unknown-linux-gnu
 LINUX_OUT    = target/$(LINUX_TARGET)/release
@@ -41,6 +41,12 @@ release-linux:
 release-all: release release-linux
 	@echo ""
 	@echo "All platform binaries built."
+	zip -j target/release/tunnix_macos_arm64.zip target/release/tunnix
+	zip -j $(LINUX_OUT)/tunnix_linux_x86_64.zip $(LINUX_OUT)/tunnix
+	@echo ""
+	@echo "All platform zips ready:"
+	@echo "  target/release/tunnix_macos_arm64.zip"
+	@echo "  $(LINUX_OUT)/tunnix_linux_x86_64.zip"
 
 # Run all tests
 test:
@@ -91,3 +97,50 @@ check: fmt clippy test
 install: release
 	cargo install --path .
 	@echo "Installed to ~/.cargo/bin/"
+
+## Bump the patch version (0.1.3 → 0.1.4) and update all version references
+bump-patch:
+	@old=$$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/'); \
+	major=$$(echo $$old | cut -d. -f1); \
+	minor=$$(echo $$old | cut -d. -f2); \
+	patch=$$(echo $$old | cut -d. -f3); \
+	new="$$major.$$minor.$$((patch+1))"; \
+	sed -i '' "s/^version = \"$$old\"/version = \"$$new\"/" Cargo.toml; \
+	sed -i '' "s/version \"$$old\"/version \"$$new\"/" Formula/tunnix.rb; \
+	sed -i '' "s|/$$old/|/$$new/|g" Formula/tunnix.rb; \
+	echo "$$old → $$new"
+
+## Bump the minor version (0.1.4 → 0.2.0) and update all version references
+bump-minor:
+	@old=$$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/'); \
+	major=$$(echo $$old | cut -d. -f1); \
+	minor=$$(echo $$old | cut -d. -f2); \
+	new="$$major.$$((minor+1)).0"; \
+	sed -i '' "s/^version = \"$$old\"/version = \"$$new\"/" Cargo.toml; \
+	sed -i '' "s/version \"$$old\"/version \"$$new\"/" Formula/tunnix.rb; \
+	sed -i '' "s|/$$old/|/$$new/|g" Formula/tunnix.rb; \
+	echo "$$old → $$new"
+
+## Bump the major version (0.1.4 → 1.0.0) and update all version references
+bump-major:
+	@old=$$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/'); \
+	major=$$(echo $$old | cut -d. -f1); \
+	new="$$((major+1)).0.0"; \
+	sed -i '' "s/^version = \"$$old\"/version = \"$$new\"/" Cargo.toml; \
+	sed -i '' "s/version \"$$old\"/version \"$$new\"/" Formula/tunnix.rb; \
+	sed -i '' "s|/$$old/|/$$new/|g" Formula/tunnix.rb; \
+	echo "$$old → $$new"
+
+## Update Formula/tunnix.rb SHA256s from local release zips (run after release-all, before upload)
+##   make update-formula
+update-formula:
+	@mac_zip="target/release/tunnix_macos_arm64.zip"; \
+	linux_zip="$(LINUX_OUT)/tunnix_linux_x86_64.zip"; \
+	echo "Computing SHA256 …"; \
+	mac_sha=$$(shasum -a 256 "$$mac_zip" | cut -d' ' -f1); \
+	linux_sha=$$(shasum -a 256 "$$linux_zip" | cut -d' ' -f1); \
+	echo "macOS SHA256: $$mac_sha"; \
+	echo "Linux  SHA256: $$linux_sha"; \
+	sed -i '' "/on_macos/,/on_linux/ s/sha256 \"[a-f0-9]*\"/sha256 \"$$mac_sha\"/" Formula/tunnix.rb; \
+	sed -i '' "/on_linux/,/def install/ s/sha256 \"[a-f0-9]*\"/sha256 \"$$linux_sha\"/" Formula/tunnix.rb; \
+	echo "Formula/tunnix.rb updated"
