@@ -18,8 +18,7 @@ tunnix routes your SOCKS5 and HTTP(S) proxy traffic through a plain HTTP connect
 
 **Homebrew (macOS / Linux):**
 ```bash
-brew tap aeroxy/tunnix https://github.com/aeroxy/tunnix
-brew install tunnix
+brew install aeroxy/tap/tunnix
 ```
 
 **Cargo:**
