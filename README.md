@@ -4,6 +4,10 @@ An encrypted SOCKS5/HTTP proxy tunnel over HTTP/SSE.
 
 tunnix routes your SOCKS5 and HTTP(S) proxy traffic through a plain HTTP connection, end-to-end encrypted with ChaCha20-Poly1305. It is designed for environments that serve HTTP but block direct TCP — Cloud Shell, Codespaces, Gitpod, or any host behind a reverse proxy.
 
+[![crates.io](https://img.shields.io/crates/v/tunnix.svg)](https://crates.io/crates/tunnix)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/aeroxy/tunnix)
+
 ## Features
 
 - **End-to-end encryption** — ChaCha20-Poly1305, Argon2id key derivation
