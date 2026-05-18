@@ -32,6 +32,11 @@ pub enum Message {
         conn_id: Option<u32>,
         message: String,
     },
+
+    /// Server tells client the session was freshly created (e.g. after a server
+    /// restart). Client must treat any existing conn_ids as orphaned and tear
+    /// them down — the server knows nothing about them.
+    Reset,
 }
 
 impl Message {

@@ -182,8 +182,10 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response<BoxBod
 
     let (sse_tx, sse_rx) = mpsc::channel::<Vec<u8>>(1024);
 
+    let was_new;
     let _session = {
         let mut sessions = state.sessions.lock().await;
+        was_new = !sessions.contains_key(session_id);
         let s = sessions
             .entry(session_id.to_string())
             .or_insert_with(|| {
@@ -195,23 +197,55 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response<BoxBod
             .clone();
 
         let mut s_lock = s.lock().await;
-        s_lock.sse_tx = sse_tx;
+        s_lock.sse_tx = sse_tx.clone();
         drop(s_lock);
         s
     };
 
-    let stream = futures::stream::unfold(sse_rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(data) => {
-                use base64ct::{Base64, Encoding};
-                let encoded = Base64::encode_string(&data);
-                let event = format!("data: {}\n\n", encoded);
-                let frame = Frame::data(Bytes::from(event));
-                Some((Ok::<_, std::convert::Infallible>(frame), rx))
+    // If we just created this session (e.g. after a server restart while the
+    // client kept its old session id), the client may still be holding orphan
+    // conn_ids that we know nothing about. Tell it to clear them.
+    if was_new {
+        let hot = state.hot.load();
+        match make_encrypted_response(&hot.crypto, &Message::Reset) {
+            Ok(payload) => {
+                if sse_tx.send(payload).await.is_err() {
+                    warn!("Failed to push Reset to fresh session {}", session_id);
+                }
             }
-            None => None,
+            Err(e) => error!("Failed to encrypt Reset for {}: {}", session_id, e),
         }
-    });
+    }
+
+    // Don't hold an extra sender here — the session keeps its own clone, and
+    // we want the rx side to hang up cleanly when the session is dropped.
+    drop(sse_tx);
+
+    // Keepalive every 15s as an SSE comment line. The client parser ignores
+    // lines without `data: `, but the byte read resets its 30s read timeout,
+    // so idle-but-healthy tunnels don't churn through reconnects.
+    let keepalive = tokio::time::interval(Duration::from_secs(15));
+    let stream = futures::stream::unfold(
+        (sse_rx, keepalive),
+        |(mut rx, mut keepalive)| async move {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(data) => {
+                        use base64ct::{Base64, Encoding};
+                        let encoded = Base64::encode_string(&data);
+                        let event = format!("data: {}\n\n", encoded);
+                        let frame = Frame::data(Bytes::from(event));
+                        Some((Ok::<_, std::convert::Infallible>(frame), (rx, keepalive)))
+                    }
+                    None => None,
+                },
+                _ = keepalive.tick() => {
+                    let frame = Frame::data(Bytes::from(":\n\n"));
+                    Some((Ok::<_, std::convert::Infallible>(frame), (rx, keepalive)))
+                }
+            }
+        },
+    );
 
     let body: BoxBody = http_body_util::Either::Right(StreamBody::new(
         Box::pin(stream) as futures::stream::BoxStream<'static, _>,

@@ -114,10 +114,14 @@ impl Tunnel {
 
         loop {
             tokio::select! {
-                chunk = stream.next() => {
+                chunk = tokio::time::timeout(Duration::from_secs(30), stream.next()) => {
                     let chunk = match chunk {
-                        Some(c) => c?,
-                        None => break,
+                        Ok(Some(c)) => c?,
+                        Ok(None) => break,
+                        Err(_) => {
+                            warn!("SSE read timeout, reconnecting");
+                            break;
+                        }
                     };
                     let text = String::from_utf8_lossy(&chunk);
                     buffer.push_str(&text);
@@ -173,25 +177,50 @@ impl Tunnel {
         match message {
             Message::Data { conn_id, data } => {
                 debug!("[{}] SSE data {} bytes", conn_id, data.len());
-                let channels = self.response_channels.lock().await;
-                if let Some(tx) = channels.get(&conn_id) {
+                // Clone the sender out of the guard before awaiting send().
+                // Holding the mutex across `tx.send().await` lets one slow
+                // consumer (full channel) stall dispatch for every connection.
+                let tx = {
+                    let channels = self.response_channels.lock().await;
+                    channels.get(&conn_id).cloned()
+                };
+                if let Some(tx) = tx {
                     let _ = tx.send(TunnelEvent::Data(data)).await;
                 }
             }
             Message::Close { conn_id } => {
                 debug!("[{}] SSE close", conn_id);
-                let channels = self.response_channels.lock().await;
-                if let Some(tx) = channels.get(&conn_id) {
+                let tx = {
+                    let channels = self.response_channels.lock().await;
+                    channels.get(&conn_id).cloned()
+                };
+                if let Some(tx) = tx {
                     let _ = tx.send(TunnelEvent::Close).await;
                 }
             }
             Message::Error { conn_id, message } => {
                 warn!("[{:?}] SSE error: {}", conn_id, message);
                 if let Some(cid) = conn_id {
-                    let channels = self.response_channels.lock().await;
-                    if let Some(tx) = channels.get(&cid) {
+                    let tx = {
+                        let channels = self.response_channels.lock().await;
+                        channels.get(&cid).cloned()
+                    };
+                    if let Some(tx) = tx {
                         let _ = tx.send(TunnelEvent::Error(message)).await;
                     }
+                }
+            }
+            Message::Reset => {
+                // Server signalled the session was freshly created (e.g. it
+                // restarted). Drop every pending response channel so the
+                // relay tasks exit and their SOCKS5/HTTP clients reconnect.
+                let mut channels = self.response_channels.lock().await;
+                let count = channels.len();
+                channels.clear();
+                if count > 0 {
+                    warn!("Server session reset: tearing down {} pending connection(s)", count);
+                } else {
+                    debug!("Server session reset (no pending connections)");
                 }
             }
             Message::Pong => debug!("PONG"),
