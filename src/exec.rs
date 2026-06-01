@@ -75,92 +75,98 @@ async fn session(
 ) -> Result<i32> {
     let (cols, rows) = terminal_size();
 
-    // Ask the server to open the PTY; the ACK is empty Data on success, or an
-    // Error (e.g. exec disabled) which we surface before touching the terminal.
-    let exec_msg = Message::Exec { conn_id, cmd, cols, rows };
-    if let Some(Message::Error { message, .. }) = tunnel.send_connect(&exec_msg).await? {
-        anyhow::bail!("{}", message);
-    }
+    // Run the session body in an inner async block so we can guarantee a
+    // `Message::Close` is sent to the server on every exit path (including
+    // `?` early returns). Without this, a tunnel error during the session
+    // would leave the server's PTY and child process orphaned.
+    let result = async {
+        // Ask the server to open the PTY; the ACK is empty Data on success, or an
+        // Error (e.g. exec disabled) which we surface before touching the terminal.
+        let exec_msg = Message::Exec { conn_id, cmd, cols, rows };
+        if let Some(Message::Error { message, .. }) = tunnel.send_connect(&exec_msg).await? {
+            anyhow::bail!("{}", message);
+        }
 
-    // PTY is live — switch the local terminal to raw mode so keystrokes and
-    // control sequences pass through untouched. Best-effort: when stdin is not a
-    // TTY (piped / redirected), we just stream without raw mode.
-    let _guard = RawGuard::enter().ok();
+        // PTY is live — switch the local terminal to raw mode so keystrokes and
+        // control sequences pass through untouched. Best-effort: when stdin is not a
+        // TTY (piped / redirected), we just stream without raw mode.
+        let _guard = RawGuard::enter().ok();
 
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut stdin_buf = vec![0u8; 8192];
-    let mut stdin_open = true;
-    let mut winch = signal(SignalKind::window_change())?;
-    let mut exit_code = 0;
-    // Only a real ExitStatus from the server makes the command's exit code
-    // meaningful. If the tunnel drops or errors first, we must not report 0.
-    let mut saw_exit = false;
-    // Whether we've forwarded any stdin bytes to the remote PTY.
-    let mut sent_input = false;
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        let mut stdin_buf = vec![0u8; 8192];
+        let mut stdin_open = true;
+        let mut winch = signal(SignalKind::window_change())?;
+        let mut exit_code = 0;
+        // Only a real ExitStatus from the server makes the command's exit code
+        // meaningful. If the tunnel drops or errors first, we must not report 0.
+        let mut saw_exit = false;
 
-    loop {
-        tokio::select! {
-            n = stdin.read(&mut stdin_buf), if stdin_open => {
-                match n {
-                    Ok(0) => {
-                        // Local stdin hit EOF. If we actually sent input, signal EOF
-                        // to the remote PTY with the terminal EOF byte (Ctrl-D/VEOF)
-                        // so canonical-mode consumers (cat, read, filters) terminate.
-                        // Skip it when nothing was sent (e.g. `cmd </dev/null`) to
-                        // avoid a stray ^D echo for commands that ignore stdin.
-                        if sent_input {
+        loop {
+            tokio::select! {
+                n = stdin.read(&mut stdin_buf), if stdin_open => {
+                    match n {
+                        Ok(0) => {
+                            // Local stdin hit EOF. Always signal EOF to the
+                            // remote PTY with the terminal EOF byte (Ctrl-D /
+                            // VEOF) so canonical-mode consumers (cat, read,
+                            // filters) terminate. Skipping this when the local
+                            // stream was already empty (e.g. `cmd </dev/null`)
+                            // would hang commands that wait for stdin to close.
                             let eof = Message::Data { conn_id, data: vec![0x04] };
                             let _ = tunnel.send_message(&eof).await;
+                            stdin_open = false;
                         }
-                        stdin_open = false;
-                    }
-                    Ok(n) => {
-                        sent_input = true;
-                        let msg = Message::Data { conn_id, data: stdin_buf[..n].to_vec() };
-                        if let Err(e) = tunnel.send_message(&msg).await {
-                            anyhow::bail!("stdin send failed: {}", e);
+                        Ok(n) => {
+                            let msg = Message::Data { conn_id, data: stdin_buf[..n].to_vec() };
+                            if let Err(e) = tunnel.send_message(&msg).await {
+                                anyhow::bail!("stdin send failed: {}", e);
+                            }
                         }
-                    }
-                    Err(e) => {
-                        debug!("stdin read error: {}", e);
-                        stdin_open = false;
+                        Err(e) => {
+                            debug!("stdin read error: {}", e);
+                            stdin_open = false;
+                        }
                     }
                 }
-            }
-            event = event_rx.recv() => {
-                match event {
-                    Some(TunnelEvent::Data(data)) => {
-                        if stdout.write_all(&data).await.is_err() {
-                            break;
+                event = event_rx.recv() => {
+                    match event {
+                        Some(TunnelEvent::Data(data)) => {
+                            if stdout.write_all(&data).await.is_err() {
+                                break;
+                            }
+                            let _ = stdout.flush().await;
                         }
-                        let _ = stdout.flush().await;
+                        Some(TunnelEvent::Exit(code)) => {
+                            exit_code = code;
+                            saw_exit = true;
+                        }
+                        Some(TunnelEvent::Error(msg)) => {
+                            anyhow::bail!("remote error: {}", msg);
+                        }
+                        Some(TunnelEvent::Close) | None => break,
                     }
-                    Some(TunnelEvent::Exit(code)) => {
-                        exit_code = code;
-                        saw_exit = true;
-                    }
-                    Some(TunnelEvent::Error(msg)) => {
-                        anyhow::bail!("remote error: {}", msg);
-                    }
-                    Some(TunnelEvent::Close) | None => break,
                 }
-            }
-            _ = winch.recv() => {
-                let (cols, rows) = terminal_size();
-                let _ = tunnel
-                    .send_message(&Message::Resize { conn_id, cols, rows })
-                    .await;
+                _ = winch.recv() => {
+                    let (cols, rows) = terminal_size();
+                    let _ = tunnel
+                        .send_message(&Message::Resize { conn_id, cols, rows })
+                        .await;
+                }
             }
         }
-    }
 
+        if saw_exit {
+            Ok(exit_code)
+        } else {
+            anyhow::bail!("connection closed before the remote command reported an exit status");
+        }
+    }
+    .await;
+
+    // Always tell the server to tear down the PTY, even on early bail — the
+    // server-side relay will then kill the child via the closed writer channel.
     let _ = tunnel.send_message(&Message::Close { conn_id }).await;
-    // _guard drops here, restoring the terminal before we return.
-
-    if saw_exit {
-        Ok(exit_code)
-    } else {
-        anyhow::bail!("connection closed before the remote command reported an exit status");
-    }
+    // _guard drops here on the success path, restoring the terminal.
+    result
 }

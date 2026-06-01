@@ -40,6 +40,10 @@ pub fn build_http_client(headers: &HashMap<String, String>) -> anyhow::Result<re
     }
     Ok(reqwest::Client::builder()
         .default_headers(default_headers)
+        // Intentional: deployments behind a corporate TLS-inspecting proxy
+        // (MITM CA) rely on this so the client trusts the proxy's re-signed
+        // cert. Do NOT remove without coordinating with operators using such
+        // proxies — they would otherwise fail every TLS handshake.
         .danger_accept_invalid_certs(true)
         .build()?)
 }

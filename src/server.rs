@@ -683,10 +683,30 @@ async fn relay_pty_connection(
             child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1)
         });
 
+    // Watchdog: an abrupt client disconnect (network drop, process killed)
+    // leaves write_tx in tcp_writers, so write_blocking never finishes and the
+    // child runs forever. Periodically probe the session's sse_tx; once the
+    // SSE receiver is gone, kill the child and join.
+    let session_watch = session.clone();
+    let sse_dead = async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let sess = session_watch.lock().await;
+            if sess.sse_tx.is_closed() {
+                return;
+            }
+        }
+    };
+
     let code = tokio::select! {
         res = &mut wait_handle => res.unwrap_or(-1),
         _ = write_blocking => {
             // Client went away (Close removed the writer sender). Kill the child.
+            let _ = killer.kill();
+            (&mut wait_handle).await.unwrap_or(-1)
+        }
+        _ = sse_dead => {
+            debug!("[{}] SSE stream closed; killing orphaned PTY child", conn_id);
             let _ = killer.kill();
             (&mut wait_handle).await.unwrap_or(-1)
         }

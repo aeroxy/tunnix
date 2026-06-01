@@ -338,7 +338,14 @@ async fn main() -> Result<()> {
             let cmd = if ra.cmd.is_empty() {
                 None
             } else {
-                Some(ra.cmd.join(" "))
+                // Shell-quote each arg so spaces / quotes inside args survive
+                // the trip through the server's `sh -c`. A plain join(" ")
+                // would re-tokenize, e.g. `echo "a b" "c"` would become
+                // `echo a b c` and the server would see four args.
+                Some(
+                    shlex::try_join(ra.cmd.iter().map(String::as_str))
+                        .unwrap_or_else(|_| ra.cmd.join(" ")),
+                )
             };
 
             let code = exec::run(tun, cmd).await?;
