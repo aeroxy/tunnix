@@ -388,7 +388,9 @@ async fn handle_send(
                     },
                 );
             }
-            info!("[{}] EXEC {} ({}x{})", conn_id, cmd.as_deref().unwrap_or("<shell>"), cols, rows);
+            info!("[{}] EXEC {} ({}x{})", conn_id, if cmd.is_some() { "cmd" } else { "<shell>" }, cols, rows);
+            // The command may contain secrets — keep it out of normal logs.
+            debug!("[{}] EXEC command: {}", conn_id, cmd.as_deref().unwrap_or("<shell>"));
 
             let pty_system = native_pty_system();
             let pair = match pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }) {
@@ -678,9 +680,16 @@ async fn relay_pty_connection(
         }
     };
 
-    // Child has exited. Drain any remaining output before reporting exit.
-    let _ = read_blocking.await;
-    let _ = forward_task.await;
+    // Child has exited. Drain any remaining output before reporting exit, but
+    // bound the wait: if a backgrounded process inherited the slave PTY, the
+    // master never sees EOF and the blocking reader would otherwise hang forever.
+    let drain = async {
+        let _ = read_blocking.await;
+        let _ = forward_task.await;
+    };
+    if tokio::time::timeout(Duration::from_secs(2), drain).await.is_err() {
+        debug!("[{}] PTY output drain timed out (background process holding the pty?)", conn_id);
+    }
 
     // Report exit code, then close the logical connection.
     for msg in [

@@ -3,7 +3,7 @@ use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{debug, error};
+use tracing::debug;
 
 use crate::protocol::Message;
 use crate::relay::next_conn_id;
@@ -57,13 +57,25 @@ pub async fn run(tunnel: Arc<Tunnel>, cmd: Option<String>) -> Result<i32> {
     let conn_id = next_conn_id();
     let mut event_rx = tunnel.register_connection(conn_id).await;
 
+    // Run the session in an inner block so the connection is always unregistered,
+    // even on an early error return.
+    let result = session(&tunnel, conn_id, &mut event_rx, cmd).await;
+    tunnel.unregister_connection(conn_id).await;
+    result
+}
+
+async fn session(
+    tunnel: &Arc<Tunnel>,
+    conn_id: u32,
+    event_rx: &mut tokio::sync::mpsc::Receiver<TunnelEvent>,
+    cmd: Option<String>,
+) -> Result<i32> {
     let (cols, rows) = terminal_size();
 
     // Ask the server to open the PTY; the ACK is empty Data on success, or an
     // Error (e.g. exec disabled) which we surface before touching the terminal.
     let exec_msg = Message::Exec { conn_id, cmd, cols, rows };
     if let Some(Message::Error { message, .. }) = tunnel.send_connect(&exec_msg).await? {
-        tunnel.unregister_connection(conn_id).await;
         anyhow::bail!("{}", message);
     }
 
@@ -78,6 +90,9 @@ pub async fn run(tunnel: Arc<Tunnel>, cmd: Option<String>) -> Result<i32> {
     let mut stdin_open = true;
     let mut winch = signal(SignalKind::window_change())?;
     let mut exit_code = 0;
+    // Only a real ExitStatus from the server makes the command's exit code
+    // meaningful. If the tunnel drops or errors first, we must not report 0.
+    let mut saw_exit = false;
 
     loop {
         tokio::select! {
@@ -91,8 +106,7 @@ pub async fn run(tunnel: Arc<Tunnel>, cmd: Option<String>) -> Result<i32> {
                     Ok(n) => {
                         let msg = Message::Data { conn_id, data: stdin_buf[..n].to_vec() };
                         if let Err(e) = tunnel.send_message(&msg).await {
-                            error!("stdin send error: {}", e);
-                            break;
+                            anyhow::bail!("stdin send failed: {}", e);
                         }
                     }
                     Err(e) => {
@@ -111,10 +125,10 @@ pub async fn run(tunnel: Arc<Tunnel>, cmd: Option<String>) -> Result<i32> {
                     }
                     Some(TunnelEvent::Exit(code)) => {
                         exit_code = code;
+                        saw_exit = true;
                     }
                     Some(TunnelEvent::Error(msg)) => {
-                        debug!("remote error: {}", msg);
-                        break;
+                        anyhow::bail!("remote error: {}", msg);
                     }
                     Some(TunnelEvent::Close) | None => break,
                 }
@@ -129,7 +143,11 @@ pub async fn run(tunnel: Arc<Tunnel>, cmd: Option<String>) -> Result<i32> {
     }
 
     let _ = tunnel.send_message(&Message::Close { conn_id }).await;
-    tunnel.unregister_connection(conn_id).await;
     // _guard drops here, restoring the terminal before we return.
-    Ok(exit_code)
+
+    if saw_exit {
+        Ok(exit_code)
+    } else {
+        anyhow::bail!("connection closed before the remote command reported an exit status");
+    }
 }

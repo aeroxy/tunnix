@@ -1,5 +1,6 @@
 mod config;
 mod crypto;
+#[cfg(unix)]
 mod exec;
 mod http_proxy;
 mod protocol;
@@ -47,6 +48,7 @@ enum Command {
     /// Run the client
     Client(ClientArgs),
     /// Run a command (or interactive shell) on the server (requires server allow_exec)
+    #[cfg(unix)]
     RemoteExec(RemoteExecArgs),
 }
 
@@ -84,6 +86,7 @@ struct ClientArgs {
     cookie: Option<String>,
 }
 
+#[cfg(unix)]
 #[derive(clap::Args, Debug)]
 struct RemoteExecArgs {
     /// Server URL (overrides config)
@@ -126,12 +129,14 @@ async fn main() -> Result<()> {
         None => Config::from_file("config.toml").unwrap_or_default(),
     };
 
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let explicit_log_level = args.log_level.is_some();
     if let Some(log_level) = args.log_level {
         config.logging.level = log_level;
     }
     // Keep the terminal clean during an interactive remote-exec session unless
     // the user explicitly asked for a log level.
+    #[cfg(unix)]
     if matches!(args.command, Command::RemoteExec(_)) && !explicit_log_level {
         config.logging.level = "error".to_string();
     }
@@ -173,6 +178,7 @@ async fn main() -> Result<()> {
         Command::Server(sa) => {
             let cli_overrides = Arc::new(CliOverrides {
                 server_password: sa.password.is_some(),
+                server_allow_exec: sa.allow_exec,
                 client_password: false,
                 client_headers: false,
             });
@@ -228,6 +234,7 @@ async fn main() -> Result<()> {
         Command::Client(ca) => {
             let cli_overrides = Arc::new(CliOverrides {
                 server_password: false,
+                server_allow_exec: false,
                 client_password: ca.password.is_some(),
                 client_headers: ca.cookie.is_some(),
             });
@@ -295,6 +302,7 @@ async fn main() -> Result<()> {
             proxy::run_proxy(&config.client.local_addr, tun).await?;
         }
 
+        #[cfg(unix)]
         Command::RemoteExec(ra) => {
             if let Some(server) = ra.server {
                 config.client.server_url = server;

@@ -10,6 +10,7 @@ use crate::crypto::Crypto;
 
 pub struct CliOverrides {
     pub server_password: bool,
+    pub server_allow_exec: bool,
     pub client_password: bool,
     pub client_headers: bool,
 }
@@ -140,7 +141,13 @@ pub async fn config_watcher_server(
         if health_body != current.health_body {
             changed.push("health_body");
         }
-        if sc.allow_exec != current.allow_exec {
+        // A CLI --allow-exec wins over the file, just like --password.
+        let allow_exec = if overrides.server_allow_exec {
+            current.allow_exec
+        } else {
+            sc.allow_exec
+        };
+        if allow_exec != current.allow_exec {
             changed.push("allow_exec");
         }
 
@@ -155,7 +162,7 @@ pub async fn config_watcher_server(
             root_redirect: sc.root_redirect.clone(),
             root_html: sc.root_html.clone(),
             health_body,
-            allow_exec: sc.allow_exec,
+            allow_exec,
         }));
 
         info!("Config reloaded: {}", changed.join(", "));
