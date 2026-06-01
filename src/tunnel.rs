@@ -124,10 +124,13 @@ impl Tunnel {
         let mut stream = resp.bytes_stream();
 
         let mut buffer = String::new();
-        // Signal readiness only AFTER the first chunk is processed. On a new
-        // session the server's first SSE frame is `Reset` (which clears pending
-        // channels); waiting for it to be handled before `connect()` returns
-        // ensures the first registration + POST can't be wiped by a late Reset.
+        // Signal readiness only AFTER the first `data:` frame is processed. On a
+        // new session the server's first data frame is `Reset` (which clears
+        // pending channels); handling it before `connect()` returns ensures the
+        // first registration + POST can't be wiped by a late Reset. We can't just
+        // wait for the first chunk: the server's keepalive `:\n\n` comment can be
+        // emitted ahead of the queued Reset (its interval's first tick is
+        // immediate), so only a real data frame guarantees the Reset is consumed.
         let mut signaled_ready = false;
 
         loop {
@@ -153,6 +156,10 @@ impl Tunnel {
                                 match Base64::decode_vec(data_str.trim()) {
                                     Ok(encrypted) => {
                                         self.handle_sse_message(&encrypted).await;
+                                        if !signaled_ready {
+                                            self.sse_ready.notify_waiters();
+                                            signaled_ready = true;
+                                        }
                                     }
                                     Err(e) => {
                                         warn!("Base64 decode error: {}", e);
@@ -160,11 +167,6 @@ impl Tunnel {
                                 }
                             }
                         }
-                    }
-
-                    if !signaled_ready {
-                        self.sse_ready.notify_waiters();
-                        signaled_ready = true;
                     }
                 }
                 _ = self.reconnect_signal.notified() => {

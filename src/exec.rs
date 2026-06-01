@@ -93,17 +93,27 @@ async fn session(
     // Only a real ExitStatus from the server makes the command's exit code
     // meaningful. If the tunnel drops or errors first, we must not report 0.
     let mut saw_exit = false;
+    // Whether we've forwarded any stdin bytes to the remote PTY.
+    let mut sent_input = false;
 
     loop {
         tokio::select! {
             n = stdin.read(&mut stdin_buf), if stdin_open => {
                 match n {
                     Ok(0) => {
-                        // Real stdin EOF (e.g. piped input ended). Stop forwarding
-                        // input but keep relaying output until the process exits.
+                        // Local stdin hit EOF. If we actually sent input, signal EOF
+                        // to the remote PTY with the terminal EOF byte (Ctrl-D/VEOF)
+                        // so canonical-mode consumers (cat, read, filters) terminate.
+                        // Skip it when nothing was sent (e.g. `cmd </dev/null`) to
+                        // avoid a stray ^D echo for commands that ignore stdin.
+                        if sent_input {
+                            let eof = Message::Data { conn_id, data: vec![0x04] };
+                            let _ = tunnel.send_message(&eof).await;
+                        }
                         stdin_open = false;
                     }
                     Ok(n) => {
+                        sent_input = true;
                         let msg = Message::Data { conn_id, data: stdin_buf[..n].to_vec() };
                         if let Err(e) = tunnel.send_message(&msg).await {
                             anyhow::bail!("stdin send failed: {}", e);
