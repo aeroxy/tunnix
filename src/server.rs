@@ -7,8 +7,10 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -23,7 +25,11 @@ type BoxBody = http_body_util::Either<
 >;
 
 struct Session {
+    /// Per-conn_id sink for client→target bytes. Covers both TCP connections and
+    /// PTYs (remote exec) — a PTY is just another duplex byte stream.
     tcp_writers: HashMap<u32, mpsc::Sender<Vec<u8>>>,
+    /// PTY masters kept alive per conn_id so we can apply terminal resizes.
+    pty_masters: HashMap<u32, Box<dyn MasterPty + Send>>,
     /// SSE channel: encrypted messages queued for streaming to client
     sse_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -191,6 +197,7 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response<BoxBod
             .or_insert_with(|| {
                 Arc::new(Mutex::new(Session {
                     tcp_writers: HashMap::new(),
+                    pty_masters: HashMap::new(),
                     sse_tx: sse_tx.clone(),
                 }))
             })
@@ -370,6 +377,98 @@ async fn handle_send(
             sess.tcp_writers.remove(&conn_id);
             ok_response("")
         }
+        Message::Exec { conn_id, cmd, cols, rows } => {
+            if !hot.allow_exec {
+                warn!("[{}] EXEC denied: remote exec disabled", conn_id);
+                return encrypted_response(
+                    &hot.crypto,
+                    &Message::Error {
+                        conn_id: Some(conn_id),
+                        message: "remote exec is disabled on this server".to_string(),
+                    },
+                );
+            }
+            info!("[{}] EXEC {} ({}x{})", conn_id, cmd.as_deref().unwrap_or("<shell>"), cols, rows);
+
+            let pty_system = native_pty_system();
+            let pair = match pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("[{}] openpty failed: {}", conn_id, e);
+                    return encrypted_response(
+                        &hot.crypto,
+                        &Message::Error { conn_id: Some(conn_id), message: format!("openpty failed: {}", e) },
+                    );
+                }
+            };
+
+            let mut builder = match &cmd {
+                Some(c) => {
+                    let mut b = CommandBuilder::new("/bin/sh");
+                    b.arg("-c");
+                    b.arg(c);
+                    b
+                }
+                None => CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())),
+            };
+            builder.env("TERM", "xterm-256color");
+
+            let child = match pair.slave.spawn_command(builder) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("[{}] spawn failed: {}", conn_id, e);
+                    return encrypted_response(
+                        &hot.crypto,
+                        &Message::Error { conn_id: Some(conn_id), message: format!("spawn failed: {}", e) },
+                    );
+                }
+            };
+            // Drop the slave handle so the master reader sees EOF once the child exits.
+            drop(pair.slave);
+
+            let reader = match pair.master.try_clone_reader() {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("[{}] clone reader failed: {}", conn_id, e);
+                    return encrypted_response(
+                        &hot.crypto,
+                        &Message::Error { conn_id: Some(conn_id), message: format!("pty reader failed: {}", e) },
+                    );
+                }
+            };
+            let writer = match pair.master.take_writer() {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("[{}] take writer failed: {}", conn_id, e);
+                    return encrypted_response(
+                        &hot.crypto,
+                        &Message::Error { conn_id: Some(conn_id), message: format!("pty writer failed: {}", e) },
+                    );
+                }
+            };
+
+            let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+            {
+                let mut sess = session.lock().await;
+                sess.tcp_writers.insert(conn_id, write_tx);
+                sess.pty_masters.insert(conn_id, pair.master);
+            }
+
+            let crypto = hot.crypto.clone();
+            tokio::spawn(async move {
+                relay_pty_connection(conn_id, reader, writer, child, write_rx, session, crypto).await;
+            });
+
+            encrypted_response(&hot.crypto, &Message::Data { conn_id, data: vec![] })
+        }
+        Message::Resize { conn_id, cols, rows } => {
+            debug!("[{}] RESIZE {}x{}", conn_id, cols, rows);
+            let sess = session.lock().await;
+            if let Some(master) = sess.pty_masters.get(&conn_id) {
+                let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+            }
+            ok_response("")
+        }
         Message::Ping => {
             match make_encrypted_response(&hot.crypto, &Message::Pong) {
                 Ok(data) => Response::builder()
@@ -386,6 +485,22 @@ async fn handle_send(
 fn make_encrypted_response(crypto: &Crypto, msg: &Message) -> Result<Vec<u8>> {
     let bytes = msg.to_bytes()?;
     Ok(crypto.encrypt(&bytes)?)
+}
+
+/// Build an HTTP 200 response whose body is the encrypted, serialized `msg`
+/// (the same octet-stream ACK shape the Connect path uses).
+fn encrypted_response(crypto: &Crypto, msg: &Message) -> Response<BoxBody> {
+    match make_encrypted_response(crypto, msg) {
+        Ok(data) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/octet-stream")
+            .body(http_body_util::Either::Left(Full::new(Bytes::from(data))))
+            .unwrap(),
+        Err(e) => {
+            error!("Encrypt response error: {}", e);
+            ok_response("error")
+        }
+    }
 }
 
 /// Relay data between an already-connected TCP stream and the tunnel SSE/POST channels.
@@ -473,4 +588,121 @@ async fn relay_tcp_connection(
     }
 
     info!("[{}] Connection closed for {}:{}", conn_id, host, port);
+}
+
+/// Relay between a PTY (remote exec) and the tunnel SSE/POST channels.
+/// PTY readers/writers are blocking std::io, so the blocking halves run on
+/// `spawn_blocking` threads and bridge to async via channels — but the SSE send
+/// path mirrors `relay_tcp_connection` so it stays reconnection-aware.
+async fn relay_pty_connection(
+    conn_id: u32,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    write_rx: mpsc::Receiver<Vec<u8>>,
+    session: Arc<Mutex<Session>>,
+    crypto: Arc<Crypto>,
+) {
+    // PTY -> SSE: blocking reader feeds a channel; an async task encrypts and
+    // forwards to the (possibly-reconnected) SSE sender.
+    let (pty_out_tx, mut pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let read_blocking = tokio::task::spawn_blocking(move || {
+        let mut reader = reader;
+        let mut buf = vec![0u8; 32768];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if pty_out_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let crypto_fwd = crypto.clone();
+    let session_fwd = session.clone();
+    let forward_task = tokio::spawn(async move {
+        while let Some(data) = pty_out_rx.recv().await {
+            let msg = Message::Data { conn_id, data };
+            let bytes = match msg.to_bytes() {
+                Ok(b) => b,
+                Err(e) => { error!("[{}] PTY serialize: {}", conn_id, e); break; }
+            };
+            let encrypted = match crypto_fwd.encrypt(&bytes) {
+                Ok(e) => e,
+                Err(e) => { error!("[{}] PTY encrypt: {}", conn_id, e); break; }
+            };
+            let sse_tx = {
+                let sess = session_fwd.lock().await;
+                sess.sse_tx.clone()
+            };
+            if sse_tx.send(encrypted).await.is_err() {
+                debug!("[{}] SSE stream replaced or closed", conn_id);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    });
+
+    // client -> PTY: blocking writer fed by the per-conn write channel.
+    let write_blocking = tokio::task::spawn_blocking(move || {
+        let mut writer = writer;
+        let mut write_rx = write_rx;
+        while let Some(data) = write_rx.blocking_recv() {
+            if data.is_empty() {
+                continue;
+            }
+            if writer.write_all(&data).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+
+    // Wait for the child; if the client side closes first, kill it.
+    let mut killer = child.clone_killer();
+    let mut wait_handle =
+        tokio::task::spawn_blocking(move || {
+            let mut child = child;
+            child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1)
+        });
+
+    let code = tokio::select! {
+        res = &mut wait_handle => res.unwrap_or(-1),
+        _ = write_blocking => {
+            // Client went away (Close removed the writer sender). Kill the child.
+            let _ = killer.kill();
+            (&mut wait_handle).await.unwrap_or(-1)
+        }
+    };
+
+    // Child has exited. Drain any remaining output before reporting exit.
+    let _ = read_blocking.await;
+    let _ = forward_task.await;
+
+    // Report exit code, then close the logical connection.
+    for msg in [
+        Message::ExitStatus { conn_id, code },
+        Message::Close { conn_id },
+    ] {
+        if let Ok(bytes) = msg.to_bytes() {
+            if let Ok(encrypted) = crypto.encrypt(&bytes) {
+                let sse_tx = {
+                    let sess = session.lock().await;
+                    sess.sse_tx.clone()
+                };
+                let _ = sse_tx.send(encrypted).await;
+            }
+        }
+    }
+
+    {
+        let mut sess = session.lock().await;
+        sess.tcp_writers.remove(&conn_id);
+        sess.pty_masters.remove(&conn_id);
+    }
+
+    info!("[{}] PTY session closed (exit {})", conn_id, code);
 }

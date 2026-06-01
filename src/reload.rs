@@ -20,6 +20,7 @@ pub struct HotServerConfig {
     pub root_redirect: Option<String>,
     pub root_html: Option<String>,
     pub health_body: String,
+    pub allow_exec: bool,
 }
 
 pub struct HotClientConfig {
@@ -139,6 +140,9 @@ pub async fn config_watcher_server(
         if health_body != current.health_body {
             changed.push("health_body");
         }
+        if sc.allow_exec != current.allow_exec {
+            changed.push("allow_exec");
+        }
 
         if changed.is_empty() {
             continue;
@@ -151,6 +155,7 @@ pub async fn config_watcher_server(
             root_redirect: sc.root_redirect.clone(),
             root_html: sc.root_html.clone(),
             health_body,
+            allow_exec: sc.allow_exec,
         }));
 
         info!("Config reloaded: {}", changed.join(", "));

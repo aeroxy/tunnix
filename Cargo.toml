@@ -61,3 +61,8 @@ base64ct = { version = "1.6", features = ["alloc"] }
 futures = "0.3"
 bytes = "1.7"
 arc-swap = "1"
+
+# Remote exec (PTY)
+portable-pty = "0.9"
+nix = { version = "0.29", features = ["term"] }
+libc = "0.2"

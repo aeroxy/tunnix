@@ -75,6 +75,10 @@ pub async fn relay(
                     debug!("[{}] tunnel error: {}", conn_id, msg);
                     break;
                 }
+                TunnelEvent::Exit(_) => {
+                    // Only meaningful for remote exec; a TCP relay never sees it.
+                    break;
+                }
             }
         }
     });
