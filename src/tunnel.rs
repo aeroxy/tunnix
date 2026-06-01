@@ -84,13 +84,22 @@ impl Tunnel {
         // Open SSE stream
         let tunnel_clone = tunnel.clone();
         tokio::spawn(async move {
+            // First iteration is the initial connect — gate readiness on the
+            // first `data:` frame so a fresh-session Reset is consumed before
+            // `register_connection` lands. On reconnects, the server won't send
+            // a Reset and the first event may be a keepalive comment; in that
+            // case signal on any event to avoid stalling `send_message`'s
+            // retry for the full RECONNECT_WAIT (10s) timeout.
+            let mut is_reconnect = false;
             loop {
-                if let Err(e) = tunnel_clone.sse_read_loop().await {
+                if let Err(e) = tunnel_clone.sse_read_loop(is_reconnect).await {
                     if e.to_string().contains("forced reconnect") {
+                        is_reconnect = true;
                         continue;
                     }
                     error!("SSE stream error: {}, reconnecting in 3s...", e);
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    is_reconnect = true;
                 }
             }
         });
@@ -106,7 +115,7 @@ impl Tunnel {
     }
 
     /// Read SSE events and dispatch to connection handlers
-    async fn sse_read_loop(&self) -> Result<()> {
+    async fn sse_read_loop(&self, is_reconnect: bool) -> Result<()> {
         let hot = self.hot.load();
         let sid = self.session_id.read().await;
         let url = format!("{}/stream/{}", hot.server_base_url, *sid);
@@ -124,13 +133,18 @@ impl Tunnel {
         let mut stream = resp.bytes_stream();
 
         let mut buffer = String::new();
-        // Signal readiness only AFTER the first `data:` frame is processed. On a
-        // new session the server's first data frame is `Reset` (which clears
-        // pending channels); handling it before `connect()` returns ensures the
-        // first registration + POST can't be wiped by a late Reset. We can't just
-        // wait for the first chunk: the server's keepalive `:\n\n` comment can be
-        // emitted ahead of the queued Reset (its interval's first tick is
-        // immediate), so only a real data frame guarantees the Reset is consumed.
+        // On the initial connect, signal readiness only AFTER the first
+        // `data:` frame is processed: a new session's first data frame is
+        // `Reset` (which clears pending channels), and handling it before
+        // `connect()` returns ensures the first registration + POST can't be
+        // wiped by a late Reset. We can't just wait for the first chunk: the
+        // server's keepalive `:\n\n` comment can be emitted ahead of the
+        // queued Reset (its interval's first tick is immediate), so only a
+        // real data frame guarantees the Reset is consumed.
+        //
+        // On reconnects the server won't queue a Reset, so the first event may
+        // be a keepalive; signal on any event to avoid stalling send_message
+        // for the full RECONNECT_WAIT (10s) timeout.
         let mut signaled_ready = false;
 
         loop {
@@ -151,21 +165,30 @@ impl Tunnel {
                         let event = buffer[..pos].to_string();
                         buffer = buffer[pos + 2..].to_string();
 
+                        let mut had_data = false;
                         for line in event.lines() {
                             if let Some(data_str) = line.strip_prefix("data: ") {
                                 match Base64::decode_vec(data_str.trim()) {
                                     Ok(encrypted) => {
                                         self.handle_sse_message(&encrypted).await;
-                                        if !signaled_ready {
-                                            self.sse_ready.notify_waiters();
-                                            signaled_ready = true;
-                                        }
+                                        had_data = true;
                                     }
                                     Err(e) => {
                                         warn!("Base64 decode error: {}", e);
                                     }
                                 }
                             }
+                        }
+                        if had_data && !signaled_ready {
+                            self.sse_ready.notify_waiters();
+                            signaled_ready = true;
+                        } else if is_reconnect && !signaled_ready {
+                            // Keepalive comment — the stream is up and the
+                            // server is not going to send a Reset. Notify
+                            // send_message's retry path so it doesn't burn
+                            // the full 10s RECONNECT_WAIT.
+                            self.sse_ready.notify_waiters();
+                            signaled_ready = true;
                         }
                     }
                 }

@@ -67,3 +67,12 @@ GET /path HTTP/1.1
 ## Buffer sizes
 
 The relay uses 32 KB read buffers (`relay.rs`). The SSE event channel per connection has a buffer of 256 messages (`tunnel.rs: mpsc::channel(256)`). These are not configurable at runtime; change them in code if throughput is a bottleneck.
+
+---
+
+## Intentional security trade-offs
+
+These are deliberate, operator-driven decisions. Do not "fix" them in a security-pass without coordination.
+
+*   **`danger_accept_invalid_certs(true)` in `reload.rs::build_http_client`** — intentional. Deployments behind a corporate TLS-inspecting proxy (re-signed certs from a MITM CA) need this to complete the handshake.
+*   **`tunnix server --allow-exec`** — opt-in only, default `false`, and the server prints a loud warning at startup when it's on. Anyone holding the server password can run a shell on the box. This is the documented feature, not a vulnerability; the warning is the contract.
