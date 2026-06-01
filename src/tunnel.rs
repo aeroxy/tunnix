@@ -28,7 +28,7 @@ pub struct Tunnel {
     pub hot: Arc<ArcSwap<HotClientConfig>>,
     pub response_channels: Arc<Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>>,
     pub reconnect_signal: Arc<Notify>,
-    sse_ready: Notify,
+    sse_ready: Arc<Notify>,
 }
 
 impl Tunnel {
@@ -55,7 +55,7 @@ impl Tunnel {
             hot,
             response_channels: Arc::new(Mutex::new(HashMap::new())),
             reconnect_signal: Arc::new(Notify::new()),
-            sse_ready: Notify::new(),
+            sse_ready: Arc::new(Notify::new()),
         });
 
         // Test connection with health check
@@ -73,6 +73,14 @@ impl Tunnel {
             );
         }
 
+        // Register interest in the first "SSE ready" notification BEFORE spawning
+        // the reader (via enable()), so we can't miss it if the stream connects
+        // fast. We hold a cloned Arc so the future doesn't borrow `tunnel`.
+        let sse_ready = tunnel.sse_ready.clone();
+        let ready = sse_ready.notified();
+        tokio::pin!(ready);
+        ready.as_mut().enable();
+
         // Open SSE stream
         let tunnel_clone = tunnel.clone();
         tokio::spawn(async move {
@@ -87,8 +95,12 @@ impl Tunnel {
             }
         });
 
-        // Wait a moment for SSE to establish
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Wait for the stream to actually establish — the server creates the
+        // session when it handles GET /stream, so the first POST /send must not
+        // race ahead of it (otherwise: 503 "unknown session").
+        if tokio::time::timeout(Duration::from_secs(10), ready).await.is_err() {
+            warn!("SSE stream not ready after 10s; proceeding anyway");
+        }
 
         Ok(tunnel)
     }
@@ -107,12 +119,16 @@ impl Tunnel {
         }
 
         info!("SSE stream connected");
-        self.sse_ready.notify_waiters();
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
 
         let mut buffer = String::new();
+        // Signal readiness only AFTER the first chunk is processed. On a new
+        // session the server's first SSE frame is `Reset` (which clears pending
+        // channels); waiting for it to be handled before `connect()` returns
+        // ensures the first registration + POST can't be wiped by a late Reset.
+        let mut signaled_ready = false;
 
         loop {
             tokio::select! {
@@ -144,6 +160,11 @@ impl Tunnel {
                                 }
                             }
                         }
+                    }
+
+                    if !signaled_ready {
+                        self.sse_ready.notify_waiters();
+                        signaled_ready = true;
                     }
                 }
                 _ = self.reconnect_signal.notified() => {
