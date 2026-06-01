@@ -30,6 +30,12 @@ password = "change-this-to-a-strong-password"
 # Connection timeout in seconds (optional)
 # timeout = 300
 
+# Allow `tunnix remote-exec` to open an interactive shell / run commands on THIS
+# machine. WARNING: this is remote code execution — anyone with the password can
+# run a shell here. Only enable on a box you control. Disabled by default.
+# Can also be enabled with the server flag --allow-exec.
+# allow_exec = false
+
 [client]
 # Server URL. If the server uses a path_prefix, include it here.
 # Examples:

@@ -1,5 +1,6 @@
 mod config;
 mod crypto;
+mod exec;
 mod http_proxy;
 mod protocol;
 mod proxy;
@@ -12,7 +13,7 @@ mod tunnel;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -45,6 +46,8 @@ enum Command {
     Server(ServerArgs),
     /// Run the client
     Client(ClientArgs),
+    /// Run a command (or interactive shell) on the server (requires server allow_exec)
+    RemoteExec(RemoteExecArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -56,6 +59,10 @@ struct ServerArgs {
     /// Password for encryption (overrides config)
     #[arg(short, long, env = "TUNNIX_PASSWORD")]
     password: Option<String>,
+
+    /// Allow remote command execution (exposes a shell — RCE). Off unless set here or in config.
+    #[arg(long)]
+    allow_exec: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -75,6 +82,25 @@ struct ClientArgs {
     /// Custom cookie header (overrides config)
     #[arg(short, long)]
     cookie: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct RemoteExecArgs {
+    /// Server URL (overrides config)
+    #[arg(short, long)]
+    server: Option<String>,
+
+    /// Password for encryption (overrides config)
+    #[arg(short, long, env = "TUNNIX_PASSWORD")]
+    password: Option<String>,
+
+    /// Custom cookie header (overrides config)
+    #[arg(short, long)]
+    cookie: Option<String>,
+
+    /// Command to run; omit for an interactive shell
+    #[arg(trailing_var_arg = true)]
+    cmd: Vec<String>,
 }
 
 fn resolve_config_path(explicit: &Option<String>) -> Option<String> {
@@ -100,8 +126,14 @@ async fn main() -> Result<()> {
         None => Config::from_file("config.toml").unwrap_or_default(),
     };
 
+    let explicit_log_level = args.log_level.is_some();
     if let Some(log_level) = args.log_level {
         config.logging.level = log_level;
+    }
+    // Keep the terminal clean during an interactive remote-exec session unless
+    // the user explicitly asked for a log level.
+    if matches!(args.command, Command::RemoteExec(_)) && !explicit_log_level {
+        config.logging.level = "error".to_string();
     }
 
     let level = match config.logging.level.to_lowercase().as_str() {
@@ -151,6 +183,9 @@ async fn main() -> Result<()> {
             if let Some(password) = sa.password {
                 config.server.password = password;
             }
+            if sa.allow_exec {
+                config.server.allow_exec = true;
+            }
 
             if config.server.password.is_empty() {
                 bail!("Password is required. Set via --password, TUNNIX_PASSWORD env var, or config file.");
@@ -165,6 +200,9 @@ async fn main() -> Result<()> {
             if !config.server.path_prefix.is_empty() {
                 info!("Path prefix: {}", config.server.path_prefix);
             }
+            if config.server.allow_exec {
+                warn!("Remote command execution ENABLED — anyone with the password can run a shell on this machine");
+            }
 
             let crypto = Arc::new(Crypto::new(&config.server.password)?);
             info!("Encryption initialized");
@@ -175,6 +213,7 @@ async fn main() -> Result<()> {
                 root_redirect: config.server.root_redirect.clone(),
                 root_html: config.server.root_html.clone(),
                 health_body: config.server.health_response.clone(),
+                allow_exec: config.server.allow_exec,
             };
 
             server::run_server(
@@ -254,6 +293,48 @@ async fn main() -> Result<()> {
             }
 
             proxy::run_proxy(&config.client.local_addr, tun).await?;
+        }
+
+        Command::RemoteExec(ra) => {
+            if let Some(server) = ra.server {
+                config.client.server_url = server;
+            }
+            if let Some(password) = ra.password {
+                config.client.password = password;
+            }
+            if let Some(cookie) = ra.cookie {
+                config.client.headers.insert("Cookie".to_string(), cookie);
+            }
+
+            if config.client.server_url.is_empty() {
+                bail!("Server URL is required. Set via --server or config file.");
+            }
+            if config.client.password.is_empty() {
+                bail!("Password is required. Set via --password, TUNNIX_PASSWORD env var, or config file.");
+            }
+
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("Failed to install rustls crypto provider");
+
+            let crypto = Arc::new(Crypto::new(&config.client.password)?);
+
+            let tun = tunnel::Tunnel::connect(
+                &config.client.server_url,
+                crypto,
+                &config.client.headers,
+                &config.client.health_expected,
+            )
+            .await?;
+
+            let cmd = if ra.cmd.is_empty() {
+                None
+            } else {
+                Some(ra.cmd.join(" "))
+            };
+
+            let code = exec::run(tun, cmd).await?;
+            std::process::exit(code);
         }
     }
 

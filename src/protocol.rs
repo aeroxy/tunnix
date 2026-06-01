@@ -37,6 +37,30 @@ pub enum Message {
     /// restart). Client must treat any existing conn_ids as orphaned and tear
     /// them down — the server knows nothing about them.
     Reset,
+
+    /// Client asks the server to open a PTY for this conn_id and run a command.
+    /// cmd = None => interactive login shell ($SHELL or /bin/sh); Some(s) => `sh -c s`.
+    /// cols/rows are the initial terminal size. The PTY's byte stream then flows
+    /// over the existing Data/Close messages, exactly like a TCP connection.
+    Exec {
+        conn_id: u32,
+        cmd: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
+
+    /// Client's terminal was resized; server applies the new size to the PTY.
+    Resize {
+        conn_id: u32,
+        cols: u16,
+        rows: u16,
+    },
+
+    /// Server reports the child process exit code (sent just before Close).
+    ExitStatus {
+        conn_id: u32,
+        code: i32,
+    },
 }
 
 impl Message {
@@ -93,6 +117,44 @@ mod tests {
                 assert_eq!(decoded_data, data);
             }
             _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn test_exec_messages() {
+        for msg in [
+            Message::Exec { conn_id: 7, cmd: Some("ls /home".into()), cols: 80, rows: 24 },
+            Message::Exec { conn_id: 8, cmd: None, cols: 120, rows: 40 },
+            Message::Resize { conn_id: 7, cols: 100, rows: 30 },
+            Message::ExitStatus { conn_id: 7, code: 42 },
+        ] {
+            let bytes = msg.to_bytes().unwrap();
+            let decoded = Message::from_bytes(&bytes).unwrap();
+            match (msg, decoded) {
+                (
+                    Message::Exec { conn_id: a, cmd: c1, cols: cl1, rows: r1 },
+                    Message::Exec { conn_id: b, cmd: c2, cols: cl2, rows: r2 },
+                ) => {
+                    assert_eq!(a, b);
+                    assert_eq!(c1, c2);
+                    assert_eq!((cl1, r1), (cl2, r2));
+                }
+                (
+                    Message::Resize { conn_id: a, cols: cl1, rows: r1 },
+                    Message::Resize { conn_id: b, cols: cl2, rows: r2 },
+                ) => {
+                    assert_eq!(a, b);
+                    assert_eq!((cl1, r1), (cl2, r2));
+                }
+                (
+                    Message::ExitStatus { conn_id: a, code: c1 },
+                    Message::ExitStatus { conn_id: b, code: c2 },
+                ) => {
+                    assert_eq!(a, b);
+                    assert_eq!(c1, c2);
+                }
+                _ => panic!("Wrong message type"),
+            }
         }
     }
 }

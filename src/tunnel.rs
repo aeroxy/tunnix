@@ -18,6 +18,8 @@ pub enum TunnelEvent {
     Data(Vec<u8>),
     Close,
     Error(String),
+    /// Remote process exited with this code (remote exec).
+    Exit(i32),
 }
 
 /// Tunnel handles communication with the server via SSE + HTTP POST
@@ -208,6 +210,16 @@ impl Tunnel {
                     if let Some(tx) = tx {
                         let _ = tx.send(TunnelEvent::Error(message)).await;
                     }
+                }
+            }
+            Message::ExitStatus { conn_id, code } => {
+                debug!("[{}] SSE exit status {}", conn_id, code);
+                let tx = {
+                    let channels = self.response_channels.lock().await;
+                    channels.get(&conn_id).cloned()
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.send(TunnelEvent::Exit(code)).await;
                 }
             }
             Message::Reset => {

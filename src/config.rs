@@ -47,6 +47,12 @@ pub struct ServerConfig {
     /// Response body for GET /health (default: "ok").
     #[serde(default = "default_health_response")]
     pub health_response: String,
+
+    /// Allow remote command execution (`tunnix remote-exec`). This exposes an
+    /// interactive shell on this machine to anyone holding the password — i.e.
+    /// remote code execution. Disabled by default.
+    #[serde(default)]
+    pub allow_exec: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -127,6 +133,7 @@ impl Default for ServerConfig {
             root_redirect: None,
             root_html: None,
             health_response: default_health_response(),
+            allow_exec: false,
         }
     }
 }
