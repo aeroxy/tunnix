@@ -18,12 +18,15 @@ fn stdin_fd() -> BorrowedFd<'static> {
 /// Current terminal size as (cols, rows), defaulting to 80x24 if unavailable.
 fn terminal_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-        (ws.ws_col, ws.ws_row)
-    } else {
-        (80, 24)
+    // stdin may be redirected (piped input) while stdout/stderr is still a TTY,
+    // so fall back across all three before defaulting.
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+        if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+            return (ws.ws_col, ws.ws_row);
+        }
     }
+    (80, 24)
 }
 
 /// Puts the terminal into raw mode and restores the original settings on drop

@@ -637,13 +637,25 @@ async fn relay_pty_connection(
                 Ok(e) => e,
                 Err(e) => { error!("[{}] PTY encrypt: {}", conn_id, e); break; }
             };
-            let sse_tx = {
-                let sess = session_fwd.lock().await;
-                sess.sse_tx.clone()
-            };
-            if sse_tx.send(encrypted).await.is_err() {
-                debug!("[{}] SSE stream replaced or closed", conn_id);
+            // Retry across a client reconnect (the SSE channel is dropped and
+            // replaced) so PTY output isn't silently lost. Re-fetch sse_tx each
+            // attempt to pick up the new channel; give up after ~5s.
+            let mut sent = false;
+            for _ in 0..50 {
+                let sse_tx = {
+                    let sess = session_fwd.lock().await;
+                    sess.sse_tx.clone()
+                };
+                if sse_tx.send(encrypted.clone()).await.is_ok() {
+                    sent = true;
+                    break;
+                }
+                debug!("[{}] SSE stream replaced or closed; retrying", conn_id);
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if !sent {
+                error!("[{}] SSE reconnect timed out; dropping PTY output", conn_id);
+                break;
             }
         }
     });
