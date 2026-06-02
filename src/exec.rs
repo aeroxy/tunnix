@@ -92,6 +92,20 @@ async fn session(
         // TTY (piped / redirected), we just stream without raw mode.
         let _guard = RawGuard::enter().ok();
 
+        // Dedicated background sender: all outbound messages (stdin data, EOF,
+        // resize) are queued into the mpsc and shipped by this task. Keeps the
+        // select! arms non-blocking so a slow POST /send can't stall stdout
+        // writes or SIGWINCH handling.
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let sender_tunnel = tunnel.clone();
+        let sender_task = tokio::spawn(async move {
+            while let Some(msg) = msg_rx.recv().await {
+                if let Err(e) = sender_tunnel.send_message(&msg).await {
+                    debug!("send_message failed: {}", e);
+                }
+            }
+        });
+
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let mut stdin_buf = vec![0u8; 8192];
@@ -101,26 +115,37 @@ async fn session(
         // Only a real ExitStatus from the server makes the command's exit code
         // meaningful. If the tunnel drops or errors first, we must not report 0.
         let mut saw_exit = false;
+        // Track whether the last forwarded byte was '\n'. On local stdin EOF,
+        // canonical-mode consumers (cat, read, ...) need a real EOF, not just a
+        // VEOF flush of an unterminated pending line. If the line is still
+        // buffered (no trailing newline), one Ctrl-D only delivers the partial
+        // line; the consumer then waits for more input forever. We send
+        // '\n' + 0x04 in that case so the line is delivered AND the next read
+        // sees EOF.
+        let mut last_was_newline = true;
 
         loop {
             tokio::select! {
                 n = stdin.read(&mut stdin_buf), if stdin_open => {
                     match n {
                         Ok(0) => {
-                            // Local stdin hit EOF. Always signal EOF to the
-                            // remote PTY with the terminal EOF byte (Ctrl-D /
-                            // VEOF) so canonical-mode consumers (cat, read,
-                            // filters) terminate. Skipping this when the local
-                            // stream was already empty (e.g. `cmd </dev/null`)
-                            // would hang commands that wait for stdin to close.
-                            let eof = Message::Data { conn_id, data: vec![0x04] };
-                            let _ = tunnel.send_message(&eof).await;
+                            // Local stdin hit EOF. Send a real EOF to the
+                            // remote PTY so canonical-mode consumers terminate.
+                            let mut eof_data = Vec::with_capacity(2);
+                            if !last_was_newline {
+                                // Terminate the pending line so the VEOF below
+                                // can actually signal EOF on an empty buffer.
+                                eof_data.push(b'\n');
+                            }
+                            eof_data.push(0x04);
+                            let _ = msg_tx.send(Message::Data { conn_id, data: eof_data });
                             stdin_open = false;
                         }
                         Ok(n) => {
+                            last_was_newline = stdin_buf[n - 1] == b'\n';
                             let msg = Message::Data { conn_id, data: stdin_buf[..n].to_vec() };
-                            if let Err(e) = tunnel.send_message(&msg).await {
-                                anyhow::bail!("stdin send failed: {}", e);
+                            if msg_tx.send(msg).is_err() {
+                                anyhow::bail!("sender channel closed");
                             }
                         }
                         Err(e) => {
@@ -149,12 +174,16 @@ async fn session(
                 }
                 _ = winch.recv() => {
                     let (cols, rows) = terminal_size();
-                    let _ = tunnel
-                        .send_message(&Message::Resize { conn_id, cols, rows })
-                        .await;
+                    let _ = msg_tx.send(Message::Resize { conn_id, cols, rows });
                 }
             }
         }
+
+        // Close the sender channel and wait for it to flush all queued
+        // messages. This guarantees the final Message::Close below is the
+        // last thing sent on the wire for this conn_id.
+        drop(msg_tx);
+        let _ = sender_task.await;
 
         if saw_exit {
             Ok(exit_code)

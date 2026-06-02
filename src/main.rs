@@ -337,11 +337,19 @@ async fn main() -> Result<()> {
 
             let cmd = if ra.cmd.is_empty() {
                 None
+            } else if ra.cmd.len() == 1 {
+                // Single arg: pass verbatim so shell metacharacters
+                // (&&, |, $VAR, ...) reach the server's `sh -c` and are
+                // interpreted by the shell. shlex would otherwise wrap the
+                // whole string in single quotes, which makes `sh` try to
+                // execute a literal command named `echo $HOME && id`.
+                Some(ra.cmd.into_iter().next().unwrap())
             } else {
-                // Shell-quote each arg so spaces / quotes inside args survive
-                // the trip through the server's `sh -c`. A plain join(" ")
-                // would re-tokenize, e.g. `echo "a b" "c"` would become
-                // `echo a b c` and the server would see four args.
+                // Multiple args: shell-quote each so spaces / quotes inside
+                // args survive the trip through the server's `sh -c`. A
+                // plain join(" ") would re-tokenize, e.g. `echo "a b" "c"`
+                // would become `echo a b c` and the server would see four
+                // args.
                 Some(
                     shlex::try_join(ra.cmd.iter().map(String::as_str))
                         .unwrap_or_else(|_| ra.cmd.join(" ")),
