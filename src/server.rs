@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -29,6 +30,7 @@ struct Session {
     /// PTYs (remote exec) — a PTY is just another duplex byte stream.
     tcp_writers: HashMap<u32, mpsc::Sender<Vec<u8>>>,
     /// PTY masters kept alive per conn_id so we can apply terminal resizes.
+    #[cfg(unix)]
     pty_masters: HashMap<u32, Box<dyn MasterPty + Send>>,
     /// SSE channel: encrypted messages queued for streaming to client
     sse_tx: mpsc::Sender<Vec<u8>>,
@@ -197,6 +199,7 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response<BoxBod
             .or_insert_with(|| {
                 Arc::new(Mutex::new(Session {
                     tcp_writers: HashMap::new(),
+                    #[cfg(unix)]
                     pty_masters: HashMap::new(),
                     sse_tx: sse_tx.clone(),
                 }))
@@ -377,6 +380,7 @@ async fn handle_send(
             sess.tcp_writers.remove(&conn_id);
             ok_response("")
         }
+        #[cfg(unix)]
         Message::Exec { conn_id, cmd, cols, rows } => {
             if !hot.allow_exec {
                 warn!("[{}] EXEC denied: remote exec disabled", conn_id);
@@ -463,12 +467,29 @@ async fn handle_send(
 
             encrypted_response(&hot.crypto, &Message::Data { conn_id, data: vec![] })
         }
+        #[cfg(not(unix))]
+        Message::Exec { conn_id, .. } => {
+            warn!("[{}] EXEC denied: remote exec is not supported on this platform", conn_id);
+            encrypted_response(
+                &hot.crypto,
+                &Message::Error {
+                    conn_id: Some(conn_id),
+                    message: "remote exec is not supported on this platform".to_string(),
+                },
+            )
+        }
+        #[cfg(unix)]
         Message::Resize { conn_id, cols, rows } => {
             debug!("[{}] RESIZE {}x{}", conn_id, cols, rows);
             let sess = session.lock().await;
             if let Some(master) = sess.pty_masters.get(&conn_id) {
                 let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
             }
+            ok_response("")
+        }
+        #[cfg(not(unix))]
+        Message::Resize { conn_id, .. } => {
+            debug!("[{}] RESIZE ignored: remote exec is not supported on this platform", conn_id);
             ok_response("")
         }
         Message::Ping => {
@@ -596,6 +617,7 @@ async fn relay_tcp_connection(
 /// PTY readers/writers are blocking std::io, so the blocking halves run on
 /// `spawn_blocking` threads and bridge to async via channels — but the SSE send
 /// path mirrors `relay_tcp_connection` so it stays reconnection-aware.
+#[cfg(unix)]
 async fn relay_pty_connection(
     conn_id: u32,
     reader: Box<dyn Read + Send>,
@@ -607,7 +629,7 @@ async fn relay_pty_connection(
 ) {
     // PTY -> SSE: blocking reader feeds a channel; an async task encrypts and
     // forwards to the (possibly-reconnected) SSE sender.
-    let (pty_out_tx, mut pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (pty_out_tx, pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
     let read_blocking = tokio::task::spawn_blocking(move || {
         let mut reader = reader;
         let mut buf = vec![0u8; 32768];
@@ -624,38 +646,35 @@ async fn relay_pty_connection(
         }
     });
 
+    // Signal sent to the forward task on child exit so it can do a final
+    // best-effort flush of whatever is currently in the channel and exit,
+    // rather than waiting indefinitely for `pty_out_rx` to close (it never
+    // does if a backgrounded process inherited the slave PTY).
+    let drain_signal = Arc::new(tokio::sync::Notify::new());
+    let drain_signal_fwd = drain_signal.clone();
     let crypto_fwd = crypto.clone();
     let session_fwd = session.clone();
     let forward_task = tokio::spawn(async move {
-        while let Some(data) = pty_out_rx.recv().await {
-            let msg = Message::Data { conn_id, data };
-            let bytes = match msg.to_bytes() {
-                Ok(b) => b,
-                Err(e) => { error!("[{}] PTY serialize: {}", conn_id, e); break; }
-            };
-            let encrypted = match crypto_fwd.encrypt(&bytes) {
-                Ok(e) => e,
-                Err(e) => { error!("[{}] PTY encrypt: {}", conn_id, e); break; }
-            };
-            // Retry across a client reconnect (the SSE channel is dropped and
-            // replaced) so PTY output isn't silently lost. Re-fetch sse_tx each
-            // attempt to pick up the new channel; give up after ~5s.
-            let mut sent = false;
-            for _ in 0..50 {
-                let sse_tx = {
-                    let sess = session_fwd.lock().await;
-                    sess.sse_tx.clone()
-                };
-                if sse_tx.send(encrypted.clone()).await.is_ok() {
-                    sent = true;
-                    break;
+        let mut pty_out_rx = pty_out_rx;
+        loop {
+            tokio::select! {
+                biased;
+                _ = drain_signal_fwd.notified() => {
+                    // Drain whatever is currently buffered and exit. The
+                    // outer timeouts bound how long this can take.
+                    while let Ok(data) = pty_out_rx.try_recv() {
+                        if !forward_pty_chunk(conn_id, data, &crypto_fwd, &session_fwd).await {
+                            return;
+                        }
+                    }
+                    return;
                 }
-                debug!("[{}] SSE stream replaced or closed; retrying", conn_id);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            if !sent {
-                error!("[{}] SSE reconnect timed out; dropping PTY output", conn_id);
-                break;
+                data = pty_out_rx.recv() => {
+                    let Some(data) = data else { return };
+                    if !forward_pty_chunk(conn_id, data, &crypto_fwd, &session_fwd).await {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -712,12 +731,17 @@ async fn relay_pty_connection(
         }
     };
 
-    // Child has exited. Drain any remaining output before reporting exit, but
-    // bound the wait: if a backgrounded process inherited the slave PTY, the
-    // master never sees EOF and the blocking reader would otherwise hang forever.
+    // Child has exited. Signal the forward task to flush whatever is in the
+    // channel, then wait briefly for the read_blocking thread to finish.
+    // Bound the wait: if a backgrounded process inherited the slave PTY, the
+    // master never sees EOF and the blocking reader would otherwise hang
+    // forever. In that case we abandon forward_task; any output still sitting
+    // in the channel when the master reader finally closes will be lost
+    // (forward_task is the only consumer).
+    drain_signal.notify_one();
     let drain = async {
-        let _ = read_blocking.await;
         let _ = forward_task.await;
+        let _ = read_blocking.await;
     };
     if tokio::time::timeout(Duration::from_secs(2), drain).await.is_err() {
         debug!("[{}] PTY output drain timed out (background process holding the pty?)", conn_id);
@@ -742,8 +766,43 @@ async fn relay_pty_connection(
     {
         let mut sess = session.lock().await;
         sess.tcp_writers.remove(&conn_id);
+        #[cfg(unix)]
         sess.pty_masters.remove(&conn_id);
     }
 
     info!("[{}] PTY session closed (exit {})", conn_id, code);
+}
+
+/// Encrypt one PTY chunk and push it to the (possibly-reconnected) SSE sender.
+/// Retries briefly across a client reconnect so a transient SSE drop doesn't
+/// lose output. Returns false if the chunk could not be delivered.
+#[cfg(unix)]
+async fn forward_pty_chunk(
+    conn_id: u32,
+    data: Vec<u8>,
+    crypto: &Crypto,
+    session: &Arc<Mutex<Session>>,
+) -> bool {
+    let msg = Message::Data { conn_id, data };
+    let bytes = match msg.to_bytes() {
+        Ok(b) => b,
+        Err(e) => { error!("[{}] PTY serialize: {}", conn_id, e); return false; }
+    };
+    let encrypted = match crypto.encrypt(&bytes) {
+        Ok(e) => e,
+        Err(e) => { error!("[{}] PTY encrypt: {}", conn_id, e); return false; }
+    };
+    for _ in 0..50 {
+        let sse_tx = {
+            let sess = session.lock().await;
+            sess.sse_tx.clone()
+        };
+        if sse_tx.send(encrypted.clone()).await.is_ok() {
+            return true;
+        }
+        debug!("[{}] SSE stream replaced or closed; retrying", conn_id);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    error!("[{}] SSE reconnect timed out; dropping PTY output", conn_id);
+    false
 }
