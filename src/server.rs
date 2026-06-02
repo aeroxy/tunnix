@@ -11,7 +11,19 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(unix)]
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
+#[cfg(unix)]
+use nix::unistd::dup;
+#[cfg(unix)]
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+#[cfg(unix)]
+use tokio::io::unix::AsyncFd;
+#[cfg(unix)]
+use tokio::io::Interest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -29,9 +41,11 @@ struct Session {
     /// Per-conn_id sink for client→target bytes. Covers both TCP connections and
     /// PTYs (remote exec) — a PTY is just another duplex byte stream.
     tcp_writers: HashMap<u32, mpsc::Sender<Vec<u8>>>,
-    /// PTY masters kept alive per conn_id so we can apply terminal resizes.
+    /// Per-conn_id resize request channel for remote-exec PTYs. Senders are
+    /// kept in the session so Message::Resize can deliver a new PtySize
+    /// without taking the master PTY out of `relay_pty_connection`.
     #[cfg(unix)]
-    pty_masters: HashMap<u32, Box<dyn MasterPty + Send>>,
+    pty_resize: HashMap<u32, mpsc::Sender<PtySize>>,
     /// SSE channel: encrypted messages queued for streaming to client
     sse_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -200,7 +214,7 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response<BoxBod
                 Arc::new(Mutex::new(Session {
                     tcp_writers: HashMap::new(),
                     #[cfg(unix)]
-                    pty_masters: HashMap::new(),
+                    pty_resize: HashMap::new(),
                     sse_tx: sse_tx.clone(),
                 }))
             })
@@ -432,17 +446,8 @@ async fn handle_send(
             // Drop the slave handle so the master reader sees EOF once the child exits.
             drop(pair.slave);
 
-            let reader = match pair.master.try_clone_reader() {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("[{}] clone reader failed: {}", conn_id, e);
-                    return encrypted_response(
-                        &hot.crypto,
-                        &Message::Error { conn_id: Some(conn_id), message: format!("pty reader failed: {}", e) },
-                    );
-                }
-            };
-            let writer = match pair.master.take_writer() {
+            let master = pair.master;
+            let writer = match master.take_writer() {
                 Ok(w) => w,
                 Err(e) => {
                     error!("[{}] take writer failed: {}", conn_id, e);
@@ -454,15 +459,16 @@ async fn handle_send(
             };
 
             let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+            let (resize_tx, resize_rx) = mpsc::channel::<PtySize>(4);
             {
                 let mut sess = session.lock().await;
                 sess.tcp_writers.insert(conn_id, write_tx);
-                sess.pty_masters.insert(conn_id, pair.master);
+                sess.pty_resize.insert(conn_id, resize_tx);
             }
 
             let crypto = hot.crypto.clone();
             tokio::spawn(async move {
-                relay_pty_connection(conn_id, reader, writer, child, write_rx, session, crypto).await;
+                relay_pty_connection(conn_id, master, writer, child, write_rx, resize_rx, session, crypto).await;
             });
 
             encrypted_response(&hot.crypto, &Message::Data { conn_id, data: vec![] })
@@ -482,8 +488,8 @@ async fn handle_send(
         Message::Resize { conn_id, cols, rows } => {
             debug!("[{}] RESIZE {}x{}", conn_id, cols, rows);
             let sess = session.lock().await;
-            if let Some(master) = sess.pty_masters.get(&conn_id) {
-                let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+            if let Some(tx) = sess.pty_resize.get(&conn_id) {
+                let _ = tx.try_send(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
             }
             ok_response("")
         }
@@ -620,67 +626,82 @@ async fn relay_tcp_connection(
 #[cfg(unix)]
 async fn relay_pty_connection(
     conn_id: u32,
-    reader: Box<dyn Read + Send>,
+    master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     write_rx: mpsc::Receiver<Vec<u8>>,
+    resize_rx: mpsc::Receiver<PtySize>,
     session: Arc<Mutex<Session>>,
     crypto: Arc<Crypto>,
 ) {
-    // PTY -> SSE: blocking reader feeds a channel; an async task encrypts and
-    // forwards to the (possibly-reconnected) SSE sender.
+    // PTY -> SSE: dup the master fd, set it non-blocking, and read it through
+    // an AsyncFd. The read task is fully async and cleanly cancellable — no
+    // blocking thread pool involvement, so a stuck background process holding
+    // the slave PTY can be abandoned without leaking an OS thread.
     let (pty_out_tx, pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
-    let read_blocking = tokio::task::spawn_blocking(move || {
-        let mut reader = reader;
-        let mut buf = vec![0u8; 32768];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if pty_out_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+    let mut read_task = {
+        let raw_fd = match master.as_raw_fd() {
+            Some(fd) => fd,
+            None => {
+                error!("[{}] master PTY has no raw fd", conn_id);
+                return;
             }
+        };
+        let dup_fd = match dup(raw_fd) {
+            Ok(fd) => fd,
+            Err(e) => {
+                error!("[{}] dup master fd failed: {}", conn_id, e);
+                return;
+            }
+        };
+        if let Err(e) = fcntl(dup_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)) {
+            error!("[{}] set O_NONBLOCK failed: {}", conn_id, e);
+            unsafe { libc::close(dup_fd) };
+            return;
         }
-    });
-
-    // Signal sent to the forward task on child exit so it can do a final
-    // best-effort flush of whatever is currently in the channel and exit,
-    // rather than waiting indefinitely for `pty_out_rx` to close (it never
-    // does if a backgrounded process inherited the slave PTY).
-    let drain_signal = Arc::new(tokio::sync::Notify::new());
-    let drain_signal_fwd = drain_signal.clone();
-    let crypto_fwd = crypto.clone();
-    let session_fwd = session.clone();
-    let forward_task = tokio::spawn(async move {
-        let mut pty_out_rx = pty_out_rx;
-        loop {
-            tokio::select! {
-                biased;
-                _ = drain_signal_fwd.notified() => {
-                    // Drain whatever is currently buffered and exit. The
-                    // outer timeouts bound how long this can take.
-                    while let Ok(data) = pty_out_rx.try_recv() {
-                        if !forward_pty_chunk(conn_id, data, &crypto_fwd, &session_fwd).await {
-                            return;
+        let file = unsafe { File::from_raw_fd(dup_fd) };
+        let mut async_fd = match AsyncFd::new(file) {
+            Ok(afd) => afd,
+            Err(e) => {
+                error!("[{}] AsyncFd::new failed: {}", conn_id, e);
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 32768];
+            loop {
+                match async_fd.try_io_mut(Interest::READABLE, |file| file.read(&mut buf)) {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => {
+                        if pty_out_tx.send(buf[..n].to_vec()).await.is_err() {
+                            return Ok(());
                         }
                     }
-                    return;
-                }
-                data = pty_out_rx.recv() => {
-                    let Some(data) = data else { return };
-                    if !forward_pty_chunk(conn_id, data, &crypto_fwd, &session_fwd).await {
-                        return;
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
                 }
             }
-        }
-    });
+        })
+    };
+
+    // forward_task: receive from pty_out_rx, encrypt and push to SSE. Exits
+    // when pty_out_rx returns None (which happens when read_task is dropped
+    // or finishes). Not awaited; it self-cleans on read_task completion.
+    let _forward_task = {
+        let crypto_fwd = crypto.clone();
+        let session_fwd = session.clone();
+        tokio::spawn(async move {
+            let mut pty_out_rx = pty_out_rx;
+            while let Some(data) = pty_out_rx.recv().await {
+                if !forward_pty_chunk(conn_id, data, &crypto_fwd, &session_fwd).await {
+                    return;
+                }
+            }
+        })
+    };
 
     // client -> PTY: blocking writer fed by the per-conn write channel.
-    let write_blocking = tokio::task::spawn_blocking(move || {
+    let mut write_blocking = tokio::task::spawn_blocking(move || {
         let mut writer = writer;
         let mut write_rx = write_rx;
         while let Some(data) = write_rx.blocking_recv() {
@@ -704,48 +725,65 @@ async fn relay_pty_connection(
 
     // Watchdog: an abrupt client disconnect (network drop, process killed)
     // leaves write_tx in tcp_writers, so write_blocking never finishes and the
-    // child runs forever. Periodically probe the session's sse_tx; once the
-    // SSE receiver is gone, kill the child and join.
+    // child runs forever. Probe the session's sse_tx; only kill the child if
+    // SSE has been continuously closed for at least 6s, so transient drops
+    // (e.g., a client reconnect within forward_pty_chunk's 5s retry window)
+    // don't kill an otherwise-healthy session.
     let session_watch = session.clone();
     let sse_dead = async move {
+        let mut closed_secs: u32 = 0;
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             let sess = session_watch.lock().await;
             if sess.sse_tx.is_closed() {
-                return;
+                closed_secs += 1;
+                if closed_secs >= 6 {
+                    return;
+                }
+            } else {
+                closed_secs = 0;
             }
         }
     };
+    // Box::pin so we can re-poll across loop iterations; the async block
+    // holds a !Unpin MutexGuard across .await.
+    let mut sse_dead = Box::pin(sse_dead);
 
-    let code = tokio::select! {
-        res = &mut wait_handle => res.unwrap_or(-1),
-        _ = write_blocking => {
-            // Client went away (Close removed the writer sender). Kill the child.
-            let _ = killer.kill();
-            (&mut wait_handle).await.unwrap_or(-1)
-        }
-        _ = sse_dead => {
-            debug!("[{}] SSE stream closed; killing orphaned PTY child", conn_id);
-            let _ = killer.kill();
-            (&mut wait_handle).await.unwrap_or(-1)
+    let mut resize_rx = resize_rx;
+    let code = loop {
+        tokio::select! {
+            res = &mut wait_handle => break res.unwrap_or(-1),
+            _ = &mut write_blocking => {
+                // Client went away (Close removed the writer sender). Kill the child.
+                let _ = killer.kill();
+                break (&mut wait_handle).await.unwrap_or(-1);
+            }
+            _ = &mut sse_dead => {
+                debug!("[{}] SSE stream closed continuously; killing orphaned PTY child", conn_id);
+                let _ = killer.kill();
+                break (&mut wait_handle).await.unwrap_or(-1);
+            }
+            new_size = resize_rx.recv() => {
+                if let Some(s) = new_size {
+                    if let Err(e) = master.resize(s) {
+                        error!("[{}] PTY resize failed: {}", conn_id, e);
+                    }
+                }
+            }
         }
     };
+    drop(master);
 
-    // Child has exited. Signal the forward task to flush whatever is in the
-    // channel, then wait briefly for the read_blocking thread to finish.
-    // Bound the wait: if a backgrounded process inherited the slave PTY, the
-    // master never sees EOF and the blocking reader would otherwise hang
-    // forever. In that case we abandon forward_task; any output still sitting
-    // in the channel when the master reader finally closes will be lost
-    // (forward_task is the only consumer).
-    drain_signal.notify_one();
-    let drain = async {
-        let _ = forward_task.await;
-        let _ = read_blocking.await;
-    };
-    if tokio::time::timeout(Duration::from_secs(2), drain).await.is_err() {
-        debug!("[{}] PTY output drain timed out (background process holding the pty?)", conn_id);
+    // Child has exited. Give the read task up to 2s to observe EOF on the
+    // master (the slave is closed by the child) and finish naturally. If a
+    // backgrounded process inherited the slave PTY the slave stays open and
+    // the read would block forever; aborting the read task closes our dup'd
+    // fd, which is safe and immediate (no thread to leak).
+    if tokio::time::timeout(Duration::from_secs(2), &mut read_task).await.is_err() {
+        debug!("[{}] PTY read loop still pending (background process holding the pty?)", conn_id);
+        read_task.abort();
     }
+    let _ = read_task.await;
 
     // Report exit code, then close the logical connection.
     for msg in [
@@ -767,7 +805,7 @@ async fn relay_pty_connection(
         let mut sess = session.lock().await;
         sess.tcp_writers.remove(&conn_id);
         #[cfg(unix)]
-        sess.pty_masters.remove(&conn_id);
+        sess.pty_resize.remove(&conn_id);
     }
 
     info!("[{}] PTY session closed (exit {})", conn_id, code);

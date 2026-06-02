@@ -70,6 +70,17 @@ The relay uses 32 KB read buffers (`relay.rs`). The SSE event channel per connec
 
 ---
 
+## `remote-exec` allocates a PTY in canonical mode
+
+`remote-exec` always allocates a pseudo-terminal (PTY) for the child process, with the slave PTY left in its default canonical (line-buffered) mode. This is the right shape for interactive use (`vim`, `bash`, top) but has two consequences for non-interactive use:
+
+*   **Piped stdin ending without a trailing newline gets one injected before EOF.** `printf abc | tunnix remote-exec sha256sum` hashes `"abc\n"`, not `"abc"`. The PTY's terminal driver delivers line-buffered data only on `\n` or VEOF; VEOF on a non-empty buffer flushes it but does *not* signal EOF. To get a real EOF the driver must first see the line terminator, so `exec.rs` synthesizes a `'\n'` before the `\x04` it sends on local EOF. The output the child sees is exactly what it would see if you had typed `abc<Enter><Ctrl-D>` interactively — but it is *not* byte-identical to the bytes the caller sent on the pipe.
+*   **Binary data through `remote-exec` is not safe.** Canonical mode also drops/parities certain bytes (^C, ^Z, ^\). For byte-fidelity use, run the command locally and tunnel only its TCP traffic through tunnix; do not pipe binary into `remote-exec`.
+
+If a non-PTY / non-canonical mode is needed, that's a separate feature (`--no-pty` or similar), not a bug to fix in the current PTY path.
+
+---
+
 ## Intentional security trade-offs
 
 These are deliberate, operator-driven decisions. Do not "fix" them in a security-pass without coordination.
