@@ -124,6 +124,17 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_message() {
+        // Reset is a unit variant; make sure it round-trips and decodes back to
+        // Reset (not some other variant sharing a discriminant).
+        let bytes = Message::Reset.to_bytes().unwrap();
+        assert!(
+            matches!(Message::from_bytes(&bytes).unwrap(), Message::Reset),
+            "Reset did not round-trip"
+        );
+    }
+
+    #[test]
     fn test_exec_messages() {
         for msg in [
             Message::Exec { conn_id: 7, cmd: Some("ls /home".into()), cols: 80, rows: 24, term: "xterm-256color".into() },
