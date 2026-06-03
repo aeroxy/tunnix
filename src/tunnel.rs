@@ -375,3 +375,109 @@ impl Tunnel {
         channels.remove(&conn_id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a Tunnel without a live server. handle_sse_message only touches
+    /// `hot.crypto` (to decrypt) and `response_channels` (to dispatch), so the
+    /// http_client / server_base_url are placeholders.
+    fn test_tunnel(password: &str) -> Tunnel {
+        let hot = HotClientConfig {
+            crypto: Arc::new(Crypto::new(password).unwrap()),
+            http_client: reqwest::Client::new(),
+            server_base_url: "http://127.0.0.1:0".to_string(),
+        };
+        Tunnel {
+            session_id: Arc::new(tokio::sync::RwLock::new("test-session".to_string())),
+            hot: Arc::new(ArcSwap::from_pointee(hot)),
+            response_channels: Arc::new(Mutex::new(HashMap::new())),
+            reconnect_signal: Arc::new(Notify::new()),
+            sse_ready: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Encrypt a message the way the server would before pushing it over SSE.
+    fn sse_frame(tunnel: &Tunnel, msg: &Message) -> Vec<u8> {
+        let bytes = msg.to_bytes().unwrap();
+        tunnel.hot.load().crypto.encrypt(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn data_is_dispatched_to_the_registered_conn() {
+        let tunnel = test_tunnel("pw");
+        let mut rx = tunnel.register_connection(1).await;
+
+        let frame = sse_frame(&tunnel, &Message::Data { conn_id: 1, data: b"hello".to_vec() });
+        tunnel.handle_sse_message(&frame).await;
+
+        match rx.try_recv() {
+            Ok(TunnelEvent::Data(d)) => assert_eq!(d, b"hello"),
+            other => panic!("expected Data event, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_delivers_a_close_event() {
+        let tunnel = test_tunnel("pw");
+        let mut rx = tunnel.register_connection(7).await;
+
+        let frame = sse_frame(&tunnel, &Message::Close { conn_id: 7 });
+        tunnel.handle_sse_message(&frame).await;
+
+        assert!(matches!(rx.try_recv(), Ok(TunnelEvent::Close)));
+    }
+
+    #[tokio::test]
+    async fn exit_status_delivers_an_exit_event() {
+        let tunnel = test_tunnel("pw");
+        let mut rx = tunnel.register_connection(3).await;
+
+        let frame = sse_frame(&tunnel, &Message::ExitStatus { conn_id: 3, code: 42 });
+        tunnel.handle_sse_message(&frame).await;
+
+        assert!(matches!(rx.try_recv(), Ok(TunnelEvent::Exit(42))));
+    }
+
+    #[tokio::test]
+    async fn reset_clears_channels_and_closes_every_receiver() {
+        let tunnel = test_tunnel("pw");
+        let mut rx1 = tunnel.register_connection(1).await;
+        let mut rx2 = tunnel.register_connection(2).await;
+        assert_eq!(tunnel.response_channels.lock().await.len(), 2);
+
+        let frame = sse_frame(&tunnel, &Message::Reset);
+        tunnel.handle_sse_message(&frame).await;
+
+        // The map is emptied...
+        assert!(tunnel.response_channels.lock().await.is_empty());
+        // ...and each dropped sender closes its receiver, so the relay tasks
+        // waiting on event_rx observe None and exit.
+        assert!(rx1.recv().await.is_none());
+        assert!(rx2.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn data_for_an_unknown_conn_is_a_silent_no_op() {
+        let tunnel = test_tunnel("pw");
+        // No registration for conn 99: must not panic and must not register one.
+        let frame = sse_frame(&tunnel, &Message::Data { conn_id: 99, data: vec![1, 2, 3] });
+        tunnel.handle_sse_message(&frame).await;
+        assert!(tunnel.response_channels.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn undecryptable_frame_is_dropped_without_dispatch() {
+        let tunnel = test_tunnel("right-pw");
+        let mut rx = tunnel.register_connection(1).await;
+
+        // Frame encrypted under a different key fails to decrypt and is ignored.
+        let wrong = Crypto::new("wrong-pw").unwrap();
+        let bytes = Message::Data { conn_id: 1, data: b"x".to_vec() }.to_bytes().unwrap();
+        let frame = wrong.encrypt(&bytes).unwrap();
+        tunnel.handle_sse_message(&frame).await;
+
+        assert!(rx.try_recv().is_err(), "nothing should have been delivered");
+    }
+}
