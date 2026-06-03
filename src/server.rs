@@ -11,19 +11,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(unix)]
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-#[cfg(unix)]
-use nix::unistd::dup;
-#[cfg(unix)]
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-#[cfg(unix)]
-use std::fs::File;
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
-#[cfg(unix)]
-use tokio::io::unix::AsyncFd;
-#[cfg(unix)]
-use tokio::io::Interest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -634,66 +622,32 @@ async fn relay_pty_connection(
     session: Arc<Mutex<Session>>,
     crypto: Arc<Crypto>,
 ) {
-    // PTY -> SSE: dup the master fd, set it non-blocking, and read it through
-    // an AsyncFd. The read task is fully async and cleanly cancellable — no
-    // blocking thread pool involvement, so a stuck background process holding
-    // the slave PTY can be abandoned without leaking an OS thread.
+    // PTY -> SSE: blocking reader on a spawn_blocking thread, bridged to async
+    // via an mpsc channel. Using try_clone_reader() gives us an independent fd
+    // that doesn't share file-status flags with the writer.
     let (pty_out_tx, pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
     let mut read_task = {
-        let raw_fd = match master.as_raw_fd() {
-            Some(fd) => fd,
-            None => {
-                error!("[{}] master PTY has no raw fd", conn_id);
-                let mut sess = session.lock().await;
-                sess.tcp_writers.remove(&conn_id);
-                sess.pty_resize.remove(&conn_id);
-                return;
-            }
-        };
-        let dup_fd = match dup(raw_fd) {
-            Ok(fd) => fd,
+        let mut reader = match master.try_clone_reader() {
+            Ok(r) => r,
             Err(e) => {
-                error!("[{}] dup master fd failed: {}", conn_id, e);
+                error!("[{}] try_clone_reader failed: {}", conn_id, e);
                 let mut sess = session.lock().await;
                 sess.tcp_writers.remove(&conn_id);
                 sess.pty_resize.remove(&conn_id);
                 return;
             }
         };
-        if let Err(e) = fcntl(dup_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)) {
-            error!("[{}] set O_NONBLOCK failed: {}", conn_id, e);
-            let _ = nix::unistd::close(dup_fd);
-            let mut sess = session.lock().await;
-            sess.tcp_writers.remove(&conn_id);
-            sess.pty_resize.remove(&conn_id);
-            return;
-        }
-        let file = unsafe { File::from_raw_fd(dup_fd) };
-        let mut async_fd = match AsyncFd::new(file) {
-            Ok(afd) => afd,
-            Err(e) => {
-                error!("[{}] AsyncFd::new failed: {}", conn_id, e);
-                let mut sess = session.lock().await;
-                sess.tcp_writers.remove(&conn_id);
-                sess.pty_resize.remove(&conn_id);
-                return;
-            }
-        };
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 32768];
             loop {
-                match async_fd.try_io_mut(Interest::READABLE, |file| file.read(&mut buf)) {
-                    Ok(0) => return Ok(()),
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
                     Ok(n) => {
-                        if pty_out_tx.send(buf[..n].to_vec()).await.is_err() {
-                            return Ok(());
+                        if pty_out_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        async_fd.readable().await?.clear_ready();
-                        continue;
-                    }
-                    Err(e) => return Err(e),
+                    Err(_) => break,
                 }
             }
         })
