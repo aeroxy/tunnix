@@ -78,7 +78,8 @@ async fn session(
     let result = async {
         // Ask the server to open the PTY; the ACK is empty Data on success, or an
         // Error (e.g. exec disabled) which we surface before touching the terminal.
-        let exec_msg = Message::Exec { conn_id, cmd, cols, rows };
+        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+        let exec_msg = Message::Exec { conn_id, cmd, cols, rows, term };
         if let Some(Message::Error { message, .. }) = tunnel.send_connect(&exec_msg).await? {
             anyhow::bail!("{}", message);
         }
@@ -102,6 +103,11 @@ async fn session(
                 }
             }
         });
+        // Poll the sender in the select! below. send_message already retries
+        // across a forced SSE reconnect, so if it returns an error the task
+        // breaks and exits — a persistent outbound failure. Detect that here
+        // instead of silently dropping the user's keystrokes into a dead task.
+        tokio::pin!(sender_task);
 
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
@@ -123,6 +129,12 @@ async fn session(
 
         loop {
             tokio::select! {
+                _res = &mut sender_task => {
+                    // The sender only exits on a persistent send failure (its
+                    // loop runs until msg_tx is dropped at teardown, which
+                    // hasn't happened yet). Treat it as a dead tunnel.
+                    anyhow::bail!("outbound sender task exited; tunnel is down");
+                }
                 n = stdin.read(&mut stdin_buf), if stdin_open => {
                     match n {
                         Ok(0) => {
