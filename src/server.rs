@@ -632,6 +632,15 @@ async fn relay_pty_connection(
             Err(e) => {
                 error!("[{}] try_clone_reader failed: {}", conn_id, e);
                 let mut sess = session.lock().await;
+                let msg = Message::Error {
+                    conn_id: Some(conn_id),
+                    message: format!("try_clone_reader failed: {}", e),
+                };
+                if let Ok(bytes) = msg.to_bytes() {
+                    if let Ok(encrypted) = crypto.encrypt(&bytes) {
+                        let _ = sess.sse_tx.send(encrypted).await;
+                    }
+                }
                 sess.tcp_writers.remove(&conn_id);
                 sess.pty_resize.remove(&conn_id);
                 return;
