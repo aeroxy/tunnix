@@ -662,7 +662,7 @@ async fn relay_pty_connection(
         };
         if let Err(e) = fcntl(dup_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)) {
             error!("[{}] set O_NONBLOCK failed: {}", conn_id, e);
-            unsafe { libc::close(dup_fd) };
+            let _ = nix::unistd::close(dup_fd);
             let mut sess = session.lock().await;
             sess.tcp_writers.remove(&conn_id);
             sess.pty_resize.remove(&conn_id);
@@ -815,11 +815,21 @@ async fn relay_pty_connection(
     ] {
         if let Ok(bytes) = msg.to_bytes() {
             if let Ok(encrypted) = crypto.encrypt(&bytes) {
-                let sse_tx = {
-                    let sess = session.lock().await;
-                    sess.sse_tx.clone()
-                };
-                let _ = sse_tx.send(encrypted).await;
+                let mut sent = false;
+                for _ in 0..50 {
+                    let sse_tx = {
+                        let sess = session.lock().await;
+                        sess.sse_tx.clone()
+                    };
+                    if sse_tx.send(encrypted.clone()).await.is_ok() {
+                        sent = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if !sent {
+                    error!("[{}] failed to deliver shutdown message", conn_id);
+                }
             }
         }
     }
