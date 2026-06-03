@@ -86,4 +86,4 @@ If a non-PTY / non-canonical mode is needed, that's a separate feature (`--no-pt
 These are deliberate, operator-driven decisions. Do not "fix" them in a security-pass without coordination.
 
 *   **`danger_accept_invalid_certs(true)` in `reload.rs::build_http_client`** — intentional. Deployments behind a corporate TLS-inspecting proxy (re-signed certs from a MITM CA) need this to complete the handshake.
-*   **`tunnix server --allow-exec`** — opt-in only, default `false`, and the server prints a loud warning at startup when it's on. Anyone holding the server password can run a shell on the box. This features is designed to give remote user GOD MODE to the server.
+*   **`tunnix server --allow-exec`** — opt-in only, default `false`, and the server prints a loud warning at startup when it's on. Anyone holding the server password can run a shell on the box. This feature is designed to give remote user GOD MODE to the server.

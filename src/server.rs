@@ -677,7 +677,10 @@ async fn relay_pty_connection(
                             return Ok(());
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        async_fd.readable().await?.clear_ready();
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 }
             }
