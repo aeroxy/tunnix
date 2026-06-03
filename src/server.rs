@@ -383,7 +383,7 @@ async fn handle_send(
             ok_response("")
         }
         #[cfg(unix)]
-        Message::Exec { conn_id, cmd, cols, rows } => {
+        Message::Exec { conn_id, cmd, cols, rows, term } => {
             if !hot.allow_exec {
                 warn!("[{}] EXEC denied: remote exec disabled", conn_id);
                 return encrypted_response(
@@ -424,7 +424,7 @@ async fn handle_send(
                     CommandBuilder::new(if shell.is_empty() { "/bin/sh".to_string() } else { shell })
                 }
             };
-            builder.env("TERM", "xterm-256color");
+            builder.env("TERM", if term.is_empty() { "xterm-256color".to_string() } else { term });
 
             let child = match pair.slave.spawn_command(builder) {
                 Ok(c) => c,

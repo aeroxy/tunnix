@@ -47,6 +47,9 @@ pub enum Message {
         cmd: Option<String>,
         cols: u16,
         rows: u16,
+        /// Client's $TERM, so the remote PTY advertises the right terminal type
+        /// (falls back to xterm-256color client-side when unset).
+        term: String,
     },
 
     /// Client's terminal was resized; server applies the new size to the PTY.
@@ -123,8 +126,8 @@ mod tests {
     #[test]
     fn test_exec_messages() {
         for msg in [
-            Message::Exec { conn_id: 7, cmd: Some("ls /home".into()), cols: 80, rows: 24 },
-            Message::Exec { conn_id: 8, cmd: None, cols: 120, rows: 40 },
+            Message::Exec { conn_id: 7, cmd: Some("ls /home".into()), cols: 80, rows: 24, term: "xterm-256color".into() },
+            Message::Exec { conn_id: 8, cmd: None, cols: 120, rows: 40, term: "screen-256color".into() },
             Message::Resize { conn_id: 7, cols: 100, rows: 30 },
             Message::ExitStatus { conn_id: 7, code: 42 },
         ] {
@@ -132,12 +135,13 @@ mod tests {
             let decoded = Message::from_bytes(&bytes).unwrap();
             match (msg, decoded) {
                 (
-                    Message::Exec { conn_id: a, cmd: c1, cols: cl1, rows: r1 },
-                    Message::Exec { conn_id: b, cmd: c2, cols: cl2, rows: r2 },
+                    Message::Exec { conn_id: a, cmd: c1, cols: cl1, rows: r1, term: t1 },
+                    Message::Exec { conn_id: b, cmd: c2, cols: cl2, rows: r2, term: t2 },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(c1, c2);
                     assert_eq!((cl1, r1), (cl2, r2));
+                    assert_eq!(t1, t2);
                 }
                 (
                     Message::Resize { conn_id: a, cols: cl1, rows: r1 },
