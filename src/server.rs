@@ -644,6 +644,9 @@ async fn relay_pty_connection(
             Some(fd) => fd,
             None => {
                 error!("[{}] master PTY has no raw fd", conn_id);
+                let mut sess = session.lock().await;
+                sess.tcp_writers.remove(&conn_id);
+                sess.pty_resize.remove(&conn_id);
                 return;
             }
         };
@@ -651,12 +654,18 @@ async fn relay_pty_connection(
             Ok(fd) => fd,
             Err(e) => {
                 error!("[{}] dup master fd failed: {}", conn_id, e);
+                let mut sess = session.lock().await;
+                sess.tcp_writers.remove(&conn_id);
+                sess.pty_resize.remove(&conn_id);
                 return;
             }
         };
         if let Err(e) = fcntl(dup_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)) {
             error!("[{}] set O_NONBLOCK failed: {}", conn_id, e);
             unsafe { libc::close(dup_fd) };
+            let mut sess = session.lock().await;
+            sess.tcp_writers.remove(&conn_id);
+            sess.pty_resize.remove(&conn_id);
             return;
         }
         let file = unsafe { File::from_raw_fd(dup_fd) };
@@ -664,6 +673,9 @@ async fn relay_pty_connection(
             Ok(afd) => afd,
             Err(e) => {
                 error!("[{}] AsyncFd::new failed: {}", conn_id, e);
+                let mut sess = session.lock().await;
+                sess.tcp_writers.remove(&conn_id);
+                sess.pty_resize.remove(&conn_id);
                 return;
             }
         };
@@ -689,7 +701,7 @@ async fn relay_pty_connection(
 
     // forward_task: receive from pty_out_rx, encrypt and push to SSE. Exits
     // when pty_out_rx returns None (read_task dropped pty_out_tx).
-    let forward_task = {
+    let mut forward_task = {
         let crypto_fwd = crypto.clone();
         let session_fwd = session.clone();
         tokio::spawn(async move {
@@ -790,9 +802,11 @@ async fn relay_pty_connection(
     // Drain forward_task so buffered PTY data reaches the client before
     // ExitStatus/Close. read_task dropped pty_out_tx, so forward_task will
     // observe None and exit once it finishes sending queued chunks.
-    if tokio::time::timeout(Duration::from_secs(2), forward_task).await.is_err() {
-        debug!("[{}] forward_task still draining after 2s, proceeding", conn_id);
+    if tokio::time::timeout(Duration::from_secs(2), &mut forward_task).await.is_err() {
+        debug!("[{}] forward_task still draining after 2s, aborting", conn_id);
+        forward_task.abort();
     }
+    let _ = forward_task.await;
 
     // Report exit code, then close the logical connection.
     for msg in [

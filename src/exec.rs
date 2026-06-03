@@ -102,6 +102,7 @@ async fn session(
             while let Some(msg) = msg_rx.recv().await {
                 if let Err(e) = sender_tunnel.send_message(&msg).await {
                     debug!("send_message failed: {}", e);
+                    break;
                 }
             }
         });
