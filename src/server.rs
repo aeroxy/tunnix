@@ -7,7 +7,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(unix)]
@@ -417,7 +417,12 @@ async fn handle_send(
                     b.arg(c);
                     b
                 }
-                None => CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())),
+                None => {
+                    // Fall back to /bin/sh when SHELL is unset OR set-but-empty;
+                    // an empty program name would make the spawn fail with ENOENT.
+                    let shell = std::env::var("SHELL").unwrap_or_default();
+                    CommandBuilder::new(if shell.is_empty() { "/bin/sh".to_string() } else { shell })
+                }
             };
             builder.env("TERM", "xterm-256color");
 
@@ -622,78 +627,144 @@ async fn relay_pty_connection(
     session: Arc<Mutex<Session>>,
     crypto: Arc<Crypto>,
 ) {
-    // PTY -> SSE: blocking reader on a spawn_blocking thread, bridged to async
-    // via an mpsc channel. Using try_clone_reader() gives us an independent fd
-    // that doesn't share file-status flags with the writer.
-    let (pty_out_tx, pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
-    let mut read_task = {
-        let mut reader = match master.try_clone_reader() {
-            Ok(r) => r,
-            Err(e) => {
-                error!("[{}] try_clone_reader failed: {}", conn_id, e);
-                let sse_tx = {
-                    let mut sess = session.lock().await;
-                    sess.tcp_writers.remove(&conn_id);
-                    sess.pty_resize.remove(&conn_id);
-                    sess.sse_tx.clone()
-                };
-                let msg = Message::Error {
-                    conn_id: Some(conn_id),
-                    message: format!("try_clone_reader failed: {}", e),
-                };
-                if let Ok(bytes) = msg.to_bytes() {
-                    if let Ok(encrypted) = crypto.encrypt(&bytes) {
-                        let _ = sse_tx.send(encrypted).await;
-                    }
-                }
-                return;
+    // PTY <-> SSE. The master fd is driven with non-blocking I/O via tokio's
+    // AsyncFd so both directions live on the async runtime, with no
+    // spawn_blocking threads. This matters on teardown: a backgrounded process
+    // can keep the slave open so the master never reaches EOF, and a blocking
+    // reader thread parked in read() cannot be cancelled (abort() only marks
+    // the JoinHandle; the OS thread lives on). An AsyncFd read task aborts
+    // cleanly instead of leaking a thread for that background process's life.
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use tokio::io::unix::AsyncFd;
+    use tokio::io::Interest;
+
+    // try_clone_reader()/take_writer() both dup() the master fd, so they all
+    // share one open file description — and therefore the O_NONBLOCK flag. We
+    // set it once on the master and hand each task its own dup'd AsyncFd.
+    let setup = (|| -> std::io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>)> {
+        let master_fd = master
+            .as_raw_fd()
+            .ok_or_else(|| std::io::Error::other("PTY master has no fd"))?;
+        unsafe {
+            let flags = libc::fcntl(master_fd, libc::F_GETFL);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
             }
+            if libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        let dup_afd = |interest| -> std::io::Result<AsyncFd<OwnedFd>> {
+            let fd = unsafe { libc::dup(master_fd) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            AsyncFd::with_interest(unsafe { OwnedFd::from_raw_fd(fd) }, interest)
         };
-        tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 32768];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if pty_out_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+        Ok((dup_afd(Interest::READABLE)?, dup_afd(Interest::WRITABLE)?))
+    })();
+    let (read_afd, write_afd) = match setup {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!("[{}] PTY async setup failed: {}", conn_id, e);
+            let sse_tx = {
+                let mut sess = session.lock().await;
+                sess.tcp_writers.remove(&conn_id);
+                sess.pty_resize.remove(&conn_id);
+                sess.sse_tx.clone()
+            };
+            let msg = Message::Error {
+                conn_id: Some(conn_id),
+                message: format!("PTY setup failed: {}", e),
+            };
+            if let Ok(bytes) = msg.to_bytes() {
+                if let Ok(encrypted) = crypto.encrypt(&bytes) {
+                    let _ = sse_tx.send(encrypted).await;
                 }
             }
-        })
+            return;
+        }
     };
 
-    // forward_task: receive from pty_out_rx, encrypt and push to SSE. Exits
-    // when pty_out_rx returns None (read_task dropped pty_out_tx).
-    let mut forward_task = {
+    // PTY -> SSE: read on the runtime, then encrypt and forward each chunk.
+    let mut read_task = {
         let crypto_fwd = crypto.clone();
         let session_fwd = session.clone();
         tokio::spawn(async move {
-            let mut pty_out_rx = pty_out_rx;
-            while let Some(data) = pty_out_rx.recv().await {
-                if !forward_pty_chunk(conn_id, data, &crypto_fwd, &session_fwd).await {
-                    return;
+            let mut buf = [0u8; 32768];
+            loop {
+                let mut guard = match read_afd.readable().await {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+                match guard.try_io(|inner| {
+                    let n = unsafe {
+                        libc::read(
+                            inner.get_ref().as_raw_fd(),
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                        )
+                    };
+                    if n < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(n as usize)
+                    }
+                }) {
+                    Ok(Ok(0)) => break, // EOF: slave fully closed
+                    Ok(Ok(n)) => {
+                        if !forward_pty_chunk(conn_id, buf[..n].to_vec(), &crypto_fwd, &session_fwd).await {
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Ok(Err(_)) => break,           // read error
+                    Err(_would_block) => continue, // readiness was spurious
                 }
             }
         })
     };
 
-    // client -> PTY: blocking writer fed by the per-conn write channel.
-    let mut write_blocking = tokio::task::spawn_blocking(move || {
-        let mut writer = writer;
-        let mut write_rx = write_rx;
-        while let Some(data) = write_rx.blocking_recv() {
-            if data.is_empty() {
-                continue;
+    // client -> PTY: drain the per-conn write channel onto the master. `writer`
+    // is moved in only so its Drop sends EOF to the shell at teardown (parity
+    // with the previous blocking writer); the bytes themselves go via write_afd.
+    let mut write_task = {
+        tokio::spawn(async move {
+            let _writer = writer;
+            let mut write_rx = write_rx;
+            while let Some(data) = write_rx.recv().await {
+                if data.is_empty() {
+                    continue;
+                }
+                let mut pos = 0;
+                while pos < data.len() {
+                    let mut guard = match write_afd.writable().await {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    match guard.try_io(|inner| {
+                        let n = unsafe {
+                            libc::write(
+                                inner.get_ref().as_raw_fd(),
+                                data[pos..].as_ptr() as *const libc::c_void,
+                                data.len() - pos,
+                            )
+                        };
+                        if n < 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(n as usize)
+                        }
+                    }) {
+                        Ok(Ok(n)) => pos += n,
+                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Ok(Err(_)) => return,
+                        Err(_would_block) => continue,
+                    }
+                }
             }
-            if writer.write_all(&data).is_err() {
-                break;
-            }
-            let _ = writer.flush();
-        }
-    });
+        })
+    };
 
     // Wait for the child; if the client side closes first, kill it.
     let mut killer = child.clone_killer();
@@ -733,7 +804,7 @@ async fn relay_pty_connection(
     let code = loop {
         tokio::select! {
             res = &mut wait_handle => break res.unwrap_or(-1),
-            _ = &mut write_blocking => {
+            _ = &mut write_task => {
                 // Client went away (Close removed the writer sender). Kill the child.
                 let _ = killer.kill();
                 break (&mut wait_handle).await.unwrap_or(-1);
@@ -754,25 +825,22 @@ async fn relay_pty_connection(
     };
     drop(master);
 
-    // Child has exited. Give the read task up to 2s to observe EOF on the
-    // master (the slave is closed by the child) and finish naturally. If a
-    // backgrounded process inherited the slave PTY the slave stays open and
-    // the read would block forever; aborting is safe for spawn_blocking (marks
-    // cancelled; the thread finishes once the blocking read returns).
+    // Child has exited. Give the read task up to 2s to drain buffered PTY
+    // output and observe EOF, then abort. With AsyncFd the read task is a plain
+    // async task: if a backgrounded process keeps the slave open so EOF never
+    // arrives, abort() cancels it immediately — no blocking thread is left
+    // parked in read() as the old spawn_blocking reader would have been.
     if tokio::time::timeout(Duration::from_secs(2), &mut read_task).await.is_err() {
-        debug!("[{}] PTY read loop still pending (background process holding the pty?)", conn_id);
+        debug!("[{}] PTY read loop still pending (background process holding the pty?); aborting", conn_id);
         read_task.abort();
         let _ = read_task.await;
     }
 
-    // Drain forward_task so buffered PTY data reaches the client before
-    // ExitStatus/Close. read_task dropped pty_out_tx, so forward_task will
-    // observe None and exit once it finishes sending queued chunks.
-    if tokio::time::timeout(Duration::from_secs(2), &mut forward_task).await.is_err() {
-        debug!("[{}] forward_task still draining after 2s, aborting", conn_id);
-        forward_task.abort();
-        let _ = forward_task.await;
-    }
+    // The write task ends on its own once the client closes the write channel;
+    // abort it in case we're tearing down while it's parked waiting for the
+    // master to become writable.
+    write_task.abort();
+    let _ = write_task.await;
 
     // Report exit code, then close the logical connection.
     for msg in [
