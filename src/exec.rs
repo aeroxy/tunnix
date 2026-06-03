@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
@@ -8,12 +7,6 @@ use tracing::debug;
 use crate::protocol::Message;
 use crate::relay::next_conn_id;
 use crate::tunnel::{Tunnel, TunnelEvent};
-
-/// stdin as a BorrowedFd (fd 0).
-fn stdin_fd() -> BorrowedFd<'static> {
-    // SAFETY: fd 0 is valid for the lifetime of the process.
-    unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) }
-}
 
 /// Current terminal size as (cols, rows), defaulting to 80x24 if unavailable.
 fn terminal_size() -> (u16, u16) {
@@ -38,7 +31,9 @@ struct RawGuard {
 impl RawGuard {
     fn enter() -> Result<Self> {
         use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
-        let fd = stdin_fd();
+        use std::os::fd::AsFd;
+        let stdin = std::io::stdin();
+        let fd = stdin.as_fd();
         let original = tcgetattr(fd)?;
         let mut raw = original.clone();
         cfmakeraw(&mut raw);
@@ -50,7 +45,8 @@ impl RawGuard {
 impl Drop for RawGuard {
     fn drop(&mut self) {
         use nix::sys::termios::{tcsetattr, SetArg};
-        let _ = tcsetattr(stdin_fd(), SetArg::TCSANOW, &self.original);
+        use std::os::fd::AsFd;
+        let _ = tcsetattr(std::io::stdin().as_fd(), SetArg::TCSANOW, &self.original);
     }
 }
 
