@@ -688,9 +688,8 @@ async fn relay_pty_connection(
     };
 
     // forward_task: receive from pty_out_rx, encrypt and push to SSE. Exits
-    // when pty_out_rx returns None (which happens when read_task is dropped
-    // or finishes). Not awaited; it self-cleans on read_task completion.
-    let _forward_task = {
+    // when pty_out_rx returns None (read_task dropped pty_out_tx).
+    let forward_task = {
         let crypto_fwd = crypto.clone();
         let session_fwd = session.clone();
         tokio::spawn(async move {
@@ -787,6 +786,13 @@ async fn relay_pty_connection(
         read_task.abort();
     }
     let _ = read_task.await;
+
+    // Drain forward_task so buffered PTY data reaches the client before
+    // ExitStatus/Close. read_task dropped pty_out_tx, so forward_task will
+    // observe None and exit once it finishes sending queued chunks.
+    if tokio::time::timeout(Duration::from_secs(2), forward_task).await.is_err() {
+        debug!("[{}] forward_task still draining after 2s, proceeding", conn_id);
+    }
 
     // Report exit code, then close the logical connection.
     for msg in [
