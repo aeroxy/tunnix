@@ -92,14 +92,17 @@ impl Tunnel {
             // retry for the full RECONNECT_WAIT (10s) timeout.
             let mut is_reconnect = false;
             loop {
-                if let Err(e) = tunnel_clone.sse_read_loop(is_reconnect).await {
-                    if e.to_string().contains("forced reconnect") {
-                        is_reconnect = true;
-                        continue;
+                let res = tunnel_clone.sse_read_loop(is_reconnect).await;
+                is_reconnect = true;
+                match res {
+                    Err(e) if e.to_string().contains("forced reconnect") => continue,
+                    Err(e) => {
+                        error!("SSE stream error: {}, reconnecting in 3s...", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     }
-                    error!("SSE stream error: {}, reconnecting in 3s...", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    is_reconnect = true;
+                    Ok(()) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
                 }
             }
         });
