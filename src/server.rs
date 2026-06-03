@@ -754,13 +754,13 @@ async fn relay_pty_connection(
     // Child has exited. Give the read task up to 2s to observe EOF on the
     // master (the slave is closed by the child) and finish naturally. If a
     // backgrounded process inherited the slave PTY the slave stays open and
-    // the read would block forever; aborting the read task closes our dup'd
-    // fd, which is safe and immediate (no thread to leak).
+    // the read would block forever; aborting is safe for spawn_blocking (marks
+    // cancelled; the thread finishes once the blocking read returns).
     if tokio::time::timeout(Duration::from_secs(2), &mut read_task).await.is_err() {
         debug!("[{}] PTY read loop still pending (background process holding the pty?)", conn_id);
         read_task.abort();
+        let _ = read_task.await;
     }
-    let _ = read_task.await;
 
     // Drain forward_task so buffered PTY data reaches the client before
     // ExitStatus/Close. read_task dropped pty_out_tx, so forward_task will
@@ -768,8 +768,8 @@ async fn relay_pty_connection(
     if tokio::time::timeout(Duration::from_secs(2), &mut forward_task).await.is_err() {
         debug!("[{}] forward_task still draining after 2s, aborting", conn_id);
         forward_task.abort();
+        let _ = forward_task.await;
     }
-    let _ = forward_task.await;
 
     // Report exit code, then close the logical connection.
     for msg in [
