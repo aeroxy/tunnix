@@ -11,6 +11,7 @@ tunnix client  (tunnix client subcommand)
   ├── socks5.rs      — SOCKS5 handshake handler
   ├── http_proxy.rs  — HTTP CONNECT + plain HTTP handler
   ├── relay.rs       — bidirectional data relay, conn_id counter
+  ├── exec.rs        — `remote-exec` client: raw terminal, SIGWINCH, PTY stream (Unix)
   └── tunnel.rs      — HTTP/SSE tunnel to server
 
         │  HTTP POST /[prefix]/send/{session_id}   (client → server, encrypted)
@@ -116,6 +117,8 @@ Three routes (all over plain HTTP/1.1 — TLS is handled by the reverse proxy / 
 
 The server decrypts every incoming body and encrypts every outgoing SSE event using the shared `Crypto` instance (ChaCha20-Poly1305, Argon2id key derivation).
 
+**PTY relay (`Exec`, Unix only)** — when `allow_exec` is set, an `Exec` message makes the server allocate a pseudo-terminal via `portable-pty`, spawn the command (or `$SHELL`) against the slave side, and relay the master FD over the same `Data`/`Close` path as a TCP connection. The blocking PTY FD is wrapped in an `AsyncFd` so reads don't block the runtime. `Resize` applies a new size to the live PTY; the child's exit code is returned as `ExitStatus` just before `Close`. A watchdog kills the orphaned child if the SSE stream stays disconnected past a few seconds. When `allow_exec` is false (the default) the server rejects `Exec` with an `Error`. See `handle_send` / `relay_pty_connection` in `src/server.rs`.
+
 ---
 
 ## Encryption
@@ -138,5 +141,8 @@ The server decrypts every incoming body and encrypts every outgoing SSE event us
 | `Close { conn_id }` | both | Connection closed |
 | `Error { conn_id, message }` | both | Error notification |
 | `Ping` / `Pong` | both | Keep-alive |
+| `Exec { conn_id, cmd, cols, rows, term }` | client → server | Open a PTY for `conn_id` and run `cmd` (`None` = interactive `$SHELL`/`/bin/sh`); `cols`/`rows`/`term` seed the PTY size and type. Requires `allow_exec` on the server (Unix only). |
+| `Resize { conn_id, cols, rows }` | client → server | Client terminal resized (SIGWINCH); server applies the new size to the PTY |
+| `ExitStatus { conn_id, code }` | server → client | Child process exit code, sent just before `Close` |
 
-`conn_id` is a `u32` that demultiplexes many logical connections over the single SSE stream.
+`conn_id` is a `u32` that demultiplexes many logical connections over the single SSE stream. An `Exec` connection reuses the same `Data`/`Close` flow as a TCP connection: after the PTY is open, its byte stream rides over `Data` messages exactly like proxied traffic.

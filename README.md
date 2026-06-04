@@ -16,6 +16,7 @@ tunnix routes your SOCKS5 and HTTP(S) proxy traffic through a plain HTTP connect
 - **Connection multiplexing** — many connections share one SSE stream
 - **Custom header injection** — for cookie-authenticated reverse proxies
 - **Path prefix support** — serve under a sub-path (`/foo/bar/stream/...`) to coexist with other apps on the same host
+- **Remote exec (opt-in)** — `tunnix remote-exec` runs a command or interactive shell on the server over the tunnel; off by default, gated behind `--allow-exec` (Unix only)
 - **Single binary** — `tunnix server` / `tunnix client`
 
 ## Installation
@@ -48,6 +49,25 @@ tunnix client \
 curl -x http://127.0.0.1:7890 https://ifconfig.me
 curl --socks5 127.0.0.1:7890 https://ifconfig.me
 ```
+
+## Remote Exec (opt-in)
+
+`tunnix remote-exec` runs a command — or an interactive shell — on the server, over the same encrypted tunnel. It is **disabled by default** and Unix-only. The server must be started with `--allow-exec` (or `allow_exec = true` in config) to authorize it.
+
+```bash
+# Server — must explicitly opt in
+tunnix server --listen 0.0.0.0:8080 --password "your-secret" --allow-exec
+
+# Client — interactive shell
+tunnix remote-exec --server https://your-host.example.com --password "your-secret"
+
+# Client — one-off command
+tunnix remote-exec --server https://your-host.example.com --password "your-secret" -- ls -la /var/log
+```
+
+It allocates a PTY on the server, so interactive programs (`vim`, `top`, `bash`) work and your terminal size (`SIGWINCH`) is forwarded. The PTY runs in canonical mode — **do not pipe binary data through it** (line-buffering injects a trailing newline on EOF and drops control bytes); tunnel raw TCP for byte-exact transfers instead.
+
+> ⚠️ **`--allow-exec` grants remote code execution.** Anyone holding the server password gets a shell on the host. The server prints a loud warning at startup when it's enabled. Only turn it on when you understand and accept that.
 
 ## Deployment Scenarios
 
@@ -162,6 +182,7 @@ Copy `config.example.toml` to `config.toml` and customize:
 listen = "0.0.0.0:8080"
 password = "your-secret"
 # path_prefix = "/tunnix"   # optional; leave empty for root
+# allow_exec = false        # opt-in remote shell (RCE) for `tunnix remote-exec`; Unix only
 
 [client]
 server_url = "https://your-host.example.com"
@@ -216,6 +237,7 @@ Local SOCKS5/HTTP client
   ├── socks5.rs      — SOCKS5 handshake (RFC 1928, CONNECT only)
   ├── http_proxy.rs  — HTTP CONNECT + plain HTTP forwarding
   ├── relay.rs       — bidirectional relay; connection ID counter
+  ├── exec.rs        — remote-exec client: raw terminal + PTY stream (Unix)
   └── tunnel.rs      — HTTP/SSE tunnel to server
           │
           │  POST /[prefix]/send/{session}    encrypted binary body
@@ -239,6 +261,7 @@ The client auto-detects the incoming protocol by peeking the first byte:
 - ChaCha20-Poly1305 AEAD, per-message random nonce
 - No plaintext payload logging
 - Use a strong, randomly generated password — it is the only credential
+- **Remote exec is off by default.** `--allow-exec` (server) grants a shell to anyone with the password — effectively full RCE on the host. Leave it disabled unless you explicitly need it.
 
 ## Use with Clash / ClashX
 
