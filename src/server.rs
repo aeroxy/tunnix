@@ -801,17 +801,20 @@ async fn relay_pty_connection(
     tokio::pin!(sse_dead);
 
     let mut resize_rx = resize_rx;
+    let mut client_gone = false;
     let code = loop {
         tokio::select! {
             res = &mut wait_handle => break res.unwrap_or(-1),
             _ = &mut write_task => {
                 // Client went away (Close removed the writer sender). Kill the child.
                 let _ = killer.kill();
+                client_gone = true;
                 break (&mut wait_handle).await.unwrap_or(-1);
             }
             _ = &mut sse_dead => {
                 debug!("[{}] SSE stream closed continuously; killing orphaned PTY child", conn_id);
                 let _ = killer.kill();
+                client_gone = true;
                 break (&mut wait_handle).await.unwrap_or(-1);
             }
             new_size = resize_rx.recv() => {
@@ -850,7 +853,11 @@ async fn relay_pty_connection(
         if let Ok(bytes) = msg.to_bytes() {
             if let Ok(encrypted) = crypto.encrypt(&bytes) {
                 let mut sent = false;
-                for _ in 0..50 {
+                // The client is already known gone (writer closed or SSE dead
+                // ≥6s past the reconnect window), so don't spin the full 5s
+                // reconnect retry — one best-effort attempt is enough.
+                let max_retries = if client_gone { 1 } else { 50 };
+                for _ in 0..max_retries {
                     let sse_tx = {
                         let sess = session.lock().await;
                         sess.sse_tx.clone()
@@ -861,7 +868,7 @@ async fn relay_pty_connection(
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                if !sent {
+                if !sent && !client_gone {
                     error!("[{}] failed to deliver shutdown message", conn_id);
                 }
             }
