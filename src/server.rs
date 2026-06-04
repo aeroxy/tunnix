@@ -796,9 +796,9 @@ async fn relay_pty_connection(
             }
         }
     };
-    // Box::pin so we can re-poll across loop iterations; the async block
-    // holds a !Unpin MutexGuard across .await.
-    let mut sse_dead = Box::pin(sse_dead);
+    // Pin to the stack so we can re-poll across loop iterations; the async
+    // block holds a !Unpin MutexGuard across .await.
+    tokio::pin!(sse_dead);
 
     let mut resize_rx = resize_rx;
     let code = loop {
