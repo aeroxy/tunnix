@@ -970,14 +970,14 @@ async fn forward_pty_chunk(
 /// Encrypt `msg` and push it to the (possibly-reconnected) SSE sender, retrying
 /// briefly across a client reconnect. Returns false if it could not be
 /// delivered. Cross-platform sibling of `forward_pty_chunk`, used by transfers.
-async fn send_to_client(msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
+async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
     let bytes = match msg.to_bytes() {
         Ok(b) => b,
-        Err(e) => { error!("transfer serialize: {}", e); return false; }
+        Err(e) => { error!("[{}] transfer serialize: {}", conn_id, e); return false; }
     };
     let encrypted = match crypto.encrypt(&bytes) {
         Ok(e) => e,
-        Err(e) => { error!("transfer encrypt: {}", e); return false; }
+        Err(e) => { error!("[{}] transfer encrypt: {}", conn_id, e); return false; }
     };
     for _ in 0..50 {
         let sse_tx = {
@@ -1005,7 +1005,7 @@ async fn relay_pull(
 
     let mut client_gone = false;
     while let Some(data) = chunks.recv().await {
-        if !send_to_client(&Message::Data { conn_id, data }, &crypto, &session).await {
+        if !send_to_client(conn_id, &Message::Data { conn_id, data }, &crypto, &session).await {
             client_gone = true;
             break;
         }
@@ -1029,6 +1029,7 @@ async fn relay_pull(
     } else if let Err(message) = result {
         error!("[{}] PULL failed: {}", conn_id, message);
         let _ = send_to_client(
+            conn_id,
             &Message::Error { conn_id: Some(conn_id), message },
             &crypto,
             &session,
@@ -1037,8 +1038,8 @@ async fn relay_pull(
     } else {
         // Only attempt Close if ExitStatus landed: a false return means the
         // client is permanently gone, so a second 5s retry round is wasted.
-        if send_to_client(&Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await {
-            let _ = send_to_client(&Message::Close { conn_id }, &crypto, &session).await;
+        if send_to_client(conn_id, &Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await {
+            let _ = send_to_client(conn_id, &Message::Close { conn_id }, &crypto, &session).await;
         }
         info!("[{}] PULL complete", conn_id);
     }
@@ -1101,14 +1102,15 @@ async fn relay_push(
         Ok(()) => {
             // Skip Close if ExitStatus failed — the client is gone and a
             // second 5s retry round would just delay task cleanup.
-            if send_to_client(&Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await {
-                let _ = send_to_client(&Message::Close { conn_id }, &crypto, &session).await;
+            if send_to_client(conn_id, &Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await {
+                let _ = send_to_client(conn_id, &Message::Close { conn_id }, &crypto, &session).await;
             }
             info!("[{}] PUSH complete", conn_id);
         }
         Err(message) => {
             error!("[{}] PUSH failed: {}", conn_id, message);
             let _ = send_to_client(
+                conn_id,
                 &Message::Error { conn_id: Some(conn_id), message },
                 &crypto,
                 &session,
