@@ -1035,8 +1035,11 @@ async fn relay_pull(
         )
         .await;
     } else {
-        let _ = send_to_client(&Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await;
-        let _ = send_to_client(&Message::Close { conn_id }, &crypto, &session).await;
+        // Only attempt Close if ExitStatus landed: a false return means the
+        // client is permanently gone, so a second 5s retry round is wasted.
+        if send_to_client(&Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await {
+            let _ = send_to_client(&Message::Close { conn_id }, &crypto, &session).await;
+        }
         info!("[{}] PULL complete", conn_id);
     }
 }
@@ -1096,8 +1099,11 @@ async fn relay_push(
 
     match result {
         Ok(()) => {
-            let _ = send_to_client(&Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await;
-            let _ = send_to_client(&Message::Close { conn_id }, &crypto, &session).await;
+            // Skip Close if ExitStatus failed — the client is gone and a
+            // second 5s retry round would just delay task cleanup.
+            if send_to_client(&Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await {
+                let _ = send_to_client(&Message::Close { conn_id }, &crypto, &session).await;
+            }
             info!("[{}] PUSH complete", conn_id);
         }
         Err(message) => {
