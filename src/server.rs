@@ -1011,6 +1011,13 @@ async fn relay_pull(
         }
     }
 
+    // If we bailed early, drop the receiver so the blocking compressor's next
+    // `blocking_send` errors out instead of parking forever on the bounded
+    // channel (which would hang `comp_handle.await` and leak the thread).
+    if client_gone {
+        drop(chunks);
+    }
+
     let result = match comp_handle.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("{:#}", e)),
@@ -1042,7 +1049,39 @@ async fn relay_push(
     session: Arc<Mutex<Session>>,
     crypto: Arc<Crypto>,
 ) {
-    let result = match unpack_handle.await {
+    // Watchdog: a client that dies mid-push (network drop, killed process)
+    // never sends Close, so its writer sender lingers in `tcp_writers` and the
+    // decompressor parks forever on a truncated archive's blocking read. Mirror
+    // the PTY watchdog — once SSE has been closed continuously for 6s, drop the
+    // writer to force EOF so the unpack fails cleanly instead of hanging.
+    let session_watch = session.clone();
+    let watchdog = async move {
+        let mut closed_secs: u32 = 0;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let closed = session_watch.lock().await.sse_tx.is_closed();
+            if closed {
+                closed_secs += 1;
+                if closed_secs >= 6 {
+                    return;
+                }
+            } else {
+                closed_secs = 0;
+            }
+        }
+    };
+
+    tokio::pin!(unpack_handle);
+    let join = tokio::select! {
+        res = &mut unpack_handle => res,
+        _ = watchdog => {
+            debug!("[{}] PUSH watchdog: SSE gone; forcing EOF on stalled unpack", conn_id);
+            // Drop the writer so the decompressor sees EOF and unblocks.
+            session.lock().await.tcp_writers.remove(&conn_id);
+            (&mut unpack_handle).await
+        }
+    };
+    let result = match join {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("{:#}", e)),
         Err(e) => Err(format!("unpack task failed: {}", e)),

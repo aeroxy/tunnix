@@ -136,7 +136,19 @@ async fn pull_session(
                     break;
                 }
             }
-            Some(TunnelEvent::Exit(0)) | Some(TunnelEvent::Close) | None => break,
+            // The server confirms a complete transfer with ExitStatus(0) before
+            // Close. A Close or stream-end without that confirmation means the
+            // server aborted mid-stream — treat it as an error, not success, so
+            // a truncated-but-parseable archive isn't reported as complete.
+            Some(TunnelEvent::Exit(0)) => break,
+            Some(TunnelEvent::Close) => {
+                transfer_err = Some("server closed the stream unexpectedly".to_string());
+                break;
+            }
+            None => {
+                transfer_err = Some("event stream ended unexpectedly".to_string());
+                break;
+            }
             Some(TunnelEvent::Exit(code)) => {
                 transfer_err = Some(format!("server reported transfer failure (exit {})", code));
                 break;
