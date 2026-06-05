@@ -131,7 +131,7 @@ struct TransferArgs {
     cookie: Option<String>,
 
     /// zstd compression level (1-22; higher = smaller but slower)
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22))]
     level: i32,
 
     /// One or more source paths followed by the destination directory (last
