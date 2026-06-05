@@ -11,6 +11,7 @@ use crate::crypto::Crypto;
 pub struct CliOverrides {
     pub server_password: bool,
     pub server_allow_exec: bool,
+    pub server_allow_transfer: bool,
     pub client_password: bool,
     pub client_headers: bool,
 }
@@ -22,6 +23,7 @@ pub struct HotServerConfig {
     pub root_html: Option<String>,
     pub health_body: String,
     pub allow_exec: bool,
+    pub allow_transfer: bool,
 }
 
 pub struct HotClientConfig {
@@ -154,6 +156,15 @@ pub async fn config_watcher_server(
         if allow_exec != current.allow_exec {
             changed.push("allow_exec");
         }
+        // A CLI --allow-transfer wins over the file, just like --allow-exec.
+        let allow_transfer = if overrides.server_allow_transfer {
+            current.allow_transfer
+        } else {
+            sc.allow_transfer
+        };
+        if allow_transfer != current.allow_transfer {
+            changed.push("allow_transfer");
+        }
 
         if changed.is_empty() {
             continue;
@@ -167,6 +178,7 @@ pub async fn config_watcher_server(
             root_html: sc.root_html.clone(),
             health_body,
             allow_exec,
+            allow_transfer,
         }));
 
         info!("Config reloaded: {}", changed.join(", "));

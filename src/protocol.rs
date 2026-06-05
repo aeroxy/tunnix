@@ -64,6 +64,24 @@ pub enum Message {
         conn_id: u32,
         code: i32,
     },
+
+    /// Client asks to download `paths` (files or dirs) from the server. The
+    /// server streams them back as a single zstd-compressed tar archive over
+    /// Data messages, then ExitStatus + Close. `level` is the zstd level.
+    Pull {
+        conn_id: u32,
+        paths: Vec<String>,
+        level: i32,
+    },
+
+    /// Client announces an upload; `path` is the destination directory on the
+    /// server. The client then streams a zstd-compressed tar archive over Data
+    /// messages and a final Close. The server reports completion with
+    /// ExitStatus + Close (or Error on failure).
+    Push {
+        conn_id: u32,
+        path: String,
+    },
 }
 
 impl Message {
@@ -167,6 +185,35 @@ mod tests {
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(c1, c2);
+                }
+                _ => panic!("Wrong message type"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_transfer_messages() {
+        for msg in [
+            Message::Pull { conn_id: 9, paths: vec!["/etc/hosts".into(), "/tmp/x".into()], level: 3 },
+            Message::Push { conn_id: 10, path: "/tmp/dest".into() },
+        ] {
+            let bytes = msg.to_bytes().unwrap();
+            let decoded = Message::from_bytes(&bytes).unwrap();
+            match (msg, decoded) {
+                (
+                    Message::Pull { conn_id: a, paths: p1, level: l1 },
+                    Message::Pull { conn_id: b, paths: p2, level: l2 },
+                ) => {
+                    assert_eq!(a, b);
+                    assert_eq!(p1, p2);
+                    assert_eq!(l1, l2);
+                }
+                (
+                    Message::Push { conn_id: a, path: p1 },
+                    Message::Push { conn_id: b, path: p2 },
+                ) => {
+                    assert_eq!(a, b);
+                    assert_eq!(p1, p2);
                 }
                 _ => panic!("Wrong message type"),
             }

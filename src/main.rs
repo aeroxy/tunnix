@@ -1,3 +1,4 @@
+mod archive;
 mod config;
 mod crypto;
 #[cfg(unix)]
@@ -9,6 +10,7 @@ mod relay;
 mod reload;
 mod server;
 mod socks5;
+mod transfer;
 mod tunnel;
 
 use anyhow::{bail, Result};
@@ -50,6 +52,10 @@ enum Command {
     /// Run a command (or interactive shell) on the server (requires server allow_exec)
     #[cfg(unix)]
     RemoteExec(RemoteExecArgs),
+    /// Upload a file or directory to the server (requires server allow_transfer)
+    Push(TransferArgs),
+    /// Download a file or directory from the server (requires server allow_transfer)
+    Pull(TransferArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -65,6 +71,10 @@ struct ServerArgs {
     /// Allow remote command execution (exposes a shell — RCE). Off unless set here or in config.
     #[arg(long)]
     allow_exec: bool,
+
+    /// Allow file transfer (push/pull — arbitrary file read/write). Off unless set here or in config.
+    #[arg(long)]
+    allow_transfer: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -106,27 +116,67 @@ struct RemoteExecArgs {
     cmd: Vec<String>,
 }
 
+#[derive(clap::Args, Debug)]
+struct TransferArgs {
+    /// Server URL (overrides config)
+    #[arg(short, long)]
+    server: Option<String>,
+
+    /// Password for encryption (overrides config)
+    #[arg(short, long, env = "TUNNIX_PASSWORD")]
+    password: Option<String>,
+
+    /// Custom cookie header (overrides config)
+    #[arg(short, long)]
+    cookie: Option<String>,
+
+    /// zstd compression level (1-22; higher = smaller but slower)
+    #[arg(long, default_value_t = 3)]
+    level: i32,
+
+    /// One or more source paths followed by the destination directory (last
+    /// arg), like `cp`. push: local sources -> remote dest. pull: remote
+    /// sources -> local dest.
+    #[arg(required = true, num_args = 2..)]
+    paths: Vec<String>,
+}
+
+/// Global per-user config: `$XDG_CONFIG_HOME/tunnix/config.toml`, falling back
+/// to `~/.config/tunnix/config.toml` (the same path on macOS and Linux).
+fn global_config_path() -> Option<std::path::PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(x) if !x.is_empty() => std::path::PathBuf::from(x),
+        _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    Some(base.join("tunnix").join("config.toml"))
+}
+
+/// Resolve which config file to load, in precedence order:
+/// 1. `-f/--config <path>` (explicit), 2. `./config.toml` (cwd),
+/// 3. `~/.config/tunnix/config.toml` (global per-user).
 fn resolve_config_path(explicit: &Option<String>) -> Option<String> {
-    match explicit {
-        Some(p) => Some(p.clone()),
-        None => {
-            if std::path::Path::new("config.toml").exists() {
-                Some("config.toml".to_string())
-            } else {
-                None
-            }
-        }
+    if let Some(p) = explicit {
+        return Some(p.clone());
     }
+    if std::path::Path::new("config.toml").exists() {
+        return Some("config.toml".to_string());
+    }
+    global_config_path()
+        .filter(|p| p.exists())
+        .and_then(|p| p.to_str().map(String::from))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Load config from file, then apply CLI overrides
-    let mut config = match &args.config {
-        Some(path) => Config::from_file(path)?,
-        None => Config::from_file("config.toml").unwrap_or_default(),
+    // Load config from file, then apply CLI overrides. An explicit -f path must
+    // parse (error otherwise); a discovered cwd/global file is best-effort.
+    let config_path = resolve_config_path(&args.config);
+    let mut config = match &config_path {
+        Some(path) if args.config.is_some() => Config::from_file(path)?,
+        Some(path) => Config::from_file(path).unwrap_or_default(),
+        None => Config::default(),
     };
 
     #[cfg_attr(not(unix), allow(unused_variables))]
@@ -138,6 +188,10 @@ async fn main() -> Result<()> {
     // the user explicitly asked for a log level.
     #[cfg(unix)]
     if matches!(args.command, Command::RemoteExec(_)) && !explicit_log_level {
+        config.logging.level = "error".to_string();
+    }
+    // Keep the terminal clean during a one-shot transfer unless asked otherwise.
+    if matches!(args.command, Command::Push(_) | Command::Pull(_)) && !explicit_log_level {
         config.logging.level = "error".to_string();
     }
 
@@ -172,13 +226,12 @@ async fn main() -> Result<()> {
         registry.init();
     }
 
-    let config_path = resolve_config_path(&args.config);
-
     match args.command {
         Command::Server(sa) => {
             let cli_overrides = Arc::new(CliOverrides {
                 server_password: sa.password.is_some(),
                 server_allow_exec: sa.allow_exec,
+                server_allow_transfer: sa.allow_transfer,
                 client_password: false,
                 client_headers: false,
             });
@@ -191,6 +244,9 @@ async fn main() -> Result<()> {
             }
             if sa.allow_exec {
                 config.server.allow_exec = true;
+            }
+            if sa.allow_transfer {
+                config.server.allow_transfer = true;
             }
 
             if config.server.password.is_empty() {
@@ -209,6 +265,9 @@ async fn main() -> Result<()> {
             if config.server.allow_exec {
                 warn!("Remote command execution ENABLED — anyone with the password can run a shell on this machine");
             }
+            if config.server.allow_transfer {
+                warn!("File transfer ENABLED — anyone with the password can read and write files on this machine");
+            }
 
             let crypto = Arc::new(Crypto::new(&config.server.password)?);
             info!("Encryption initialized");
@@ -220,6 +279,7 @@ async fn main() -> Result<()> {
                 root_html: config.server.root_html.clone(),
                 health_body: config.server.health_response.clone(),
                 allow_exec: config.server.allow_exec,
+                allow_transfer: config.server.allow_transfer,
             };
 
             server::run_server(
@@ -235,6 +295,7 @@ async fn main() -> Result<()> {
             let cli_overrides = Arc::new(CliOverrides {
                 server_password: false,
                 server_allow_exec: false,
+                server_allow_transfer: false,
                 client_password: ca.password.is_some(),
                 client_headers: ca.cookie.is_some(),
             });
@@ -359,7 +420,64 @@ async fn main() -> Result<()> {
             let code = exec::run(tun, cmd).await?;
             std::process::exit(code);
         }
+
+        Command::Push(ta) => {
+            // Last path is the remote destination directory; the rest are local sources.
+            let (dest, sources) = ta.paths.split_last().unwrap();
+            let locals: Vec<std::path::PathBuf> = sources.iter().map(Into::into).collect();
+            let tun = connect_transfer_tunnel(&mut config, ta.server, ta.password, ta.cookie).await?;
+            transfer::push(tun, locals, dest.clone(), ta.level).await?;
+            println!("push complete");
+        }
+
+        Command::Pull(ta) => {
+            // Last path is the local destination directory; the rest are remote sources.
+            let (dest, sources) = ta.paths.split_last().unwrap();
+            let tun = connect_transfer_tunnel(&mut config, ta.server, ta.password, ta.cookie).await?;
+            transfer::pull(tun, sources.to_vec(), dest.into(), ta.level).await?;
+            println!("pull complete");
+        }
     }
 
     Ok(())
+}
+
+/// Apply client CLI overrides, init crypto + rustls, and connect a tunnel for a
+/// one-shot transfer. Shared by `push` and `pull`.
+async fn connect_transfer_tunnel(
+    config: &mut Config,
+    server: Option<String>,
+    password: Option<String>,
+    cookie: Option<String>,
+) -> Result<Arc<tunnel::Tunnel>> {
+    if let Some(server) = server {
+        config.client.server_url = server;
+    }
+    if let Some(password) = password {
+        config.client.password = password;
+    }
+    if let Some(cookie) = cookie {
+        config.client.headers.insert("Cookie".to_string(), cookie);
+    }
+
+    if config.client.server_url.is_empty() {
+        bail!("Server URL is required. Set via --server or config file.");
+    }
+    if config.client.password.is_empty() {
+        bail!("Password is required. Set via --password, TUNNIX_PASSWORD env var, or config file.");
+    }
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
+    let crypto = Arc::new(Crypto::new(&config.client.password)?);
+
+    tunnel::Tunnel::connect(
+        &config.client.server_url,
+        crypto,
+        &config.client.headers,
+        &config.client.health_expected,
+    )
+    .await
 }

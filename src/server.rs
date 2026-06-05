@@ -8,6 +8,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(unix)]
@@ -16,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
+use crate::archive::{spawn_compress, spawn_decompress};
 use crate::crypto::Crypto;
 use crate::protocol::Message;
 use crate::reload::{CliOverrides, HotServerConfig};
@@ -491,6 +493,52 @@ async fn handle_send(
             debug!("[{}] RESIZE ignored: remote exec is not supported on this platform", conn_id);
             ok_response("")
         }
+        Message::Pull { conn_id, paths, level } => {
+            if !hot.allow_transfer {
+                warn!("[{}] PULL denied: file transfer disabled", conn_id);
+                return encrypted_response(
+                    &hot.crypto,
+                    &Message::Error {
+                        conn_id: Some(conn_id),
+                        message: "file transfer is disabled on this server".to_string(),
+                    },
+                );
+            }
+            info!("[{}] PULL {}", conn_id, paths.join(", "));
+            let srcs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+            let crypto = hot.crypto.clone();
+            tokio::spawn(async move {
+                relay_pull(conn_id, srcs, level, session, crypto).await;
+            });
+            // ACK so the client starts unpacking; the archive follows over SSE.
+            encrypted_response(&hot.crypto, &Message::Data { conn_id, data: vec![] })
+        }
+        Message::Push { conn_id, path } => {
+            if !hot.allow_transfer {
+                warn!("[{}] PUSH denied: file transfer disabled", conn_id);
+                return encrypted_response(
+                    &hot.crypto,
+                    &Message::Error {
+                        conn_id: Some(conn_id),
+                        message: "file transfer is disabled on this server".to_string(),
+                    },
+                );
+            }
+            info!("[{}] PUSH -> {}", conn_id, path);
+            // Register the decompressor's input as this conn's writer: the
+            // existing Data handler forwards incoming chunks to it, and the
+            // Close handler drops it (EOF) when the client finishes streaming.
+            let (chunk_tx, unpack_handle) = spawn_decompress(PathBuf::from(path));
+            {
+                let mut sess = session.lock().await;
+                sess.tcp_writers.insert(conn_id, chunk_tx);
+            }
+            let crypto = hot.crypto.clone();
+            tokio::spawn(async move {
+                relay_push(conn_id, unpack_handle, session, crypto).await;
+            });
+            encrypted_response(&hot.crypto, &Message::Data { conn_id, data: vec![] })
+        }
         Message::Ping => {
             match make_encrypted_response(&hot.crypto, &Message::Pong) {
                 Ok(data) => Response::builder()
@@ -917,4 +965,110 @@ async fn forward_pty_chunk(
     }
     error!("[{}] SSE reconnect timed out; dropping PTY output", conn_id);
     false
+}
+
+/// Encrypt `msg` and push it to the (possibly-reconnected) SSE sender, retrying
+/// briefly across a client reconnect. Returns false if it could not be
+/// delivered. Cross-platform sibling of `forward_pty_chunk`, used by transfers.
+async fn send_to_client(msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
+    let bytes = match msg.to_bytes() {
+        Ok(b) => b,
+        Err(e) => { error!("transfer serialize: {}", e); return false; }
+    };
+    let encrypted = match crypto.encrypt(&bytes) {
+        Ok(e) => e,
+        Err(e) => { error!("transfer encrypt: {}", e); return false; }
+    };
+    for _ in 0..50 {
+        let sse_tx = {
+            let sess = session.lock().await;
+            sess.sse_tx.clone()
+        };
+        if sse_tx.send(encrypted.clone()).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// `pull`: tar + zstd-compress `path` and stream it to the client over SSE,
+/// then report completion (ExitStatus + Close) or an Error.
+async fn relay_pull(
+    conn_id: u32,
+    paths: Vec<PathBuf>,
+    level: i32,
+    session: Arc<Mutex<Session>>,
+    crypto: Arc<Crypto>,
+) {
+    let (mut chunks, comp_handle) = spawn_compress(paths, level);
+
+    let mut client_gone = false;
+    while let Some(data) = chunks.recv().await {
+        if !send_to_client(&Message::Data { conn_id, data }, &crypto, &session).await {
+            client_gone = true;
+            break;
+        }
+    }
+
+    let result = match comp_handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("{:#}", e)),
+        Err(e) => Err(format!("compress task failed: {}", e)),
+    };
+
+    if client_gone {
+        debug!("[{}] PULL aborted: client connection lost", conn_id);
+    } else if let Err(message) = result {
+        error!("[{}] PULL failed: {}", conn_id, message);
+        let _ = send_to_client(
+            &Message::Error { conn_id: Some(conn_id), message },
+            &crypto,
+            &session,
+        )
+        .await;
+    } else {
+        let _ = send_to_client(&Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await;
+        let _ = send_to_client(&Message::Close { conn_id }, &crypto, &session).await;
+        info!("[{}] PULL complete", conn_id);
+    }
+}
+
+/// `push`: await the decompressor draining the client's incoming archive (fed
+/// via the conn's writer channel + Close), then report completion or an Error.
+async fn relay_push(
+    conn_id: u32,
+    unpack_handle: tokio::task::JoinHandle<Result<()>>,
+    session: Arc<Mutex<Session>>,
+    crypto: Arc<Crypto>,
+) {
+    let result = match unpack_handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("{:#}", e)),
+        Err(e) => Err(format!("unpack task failed: {}", e)),
+    };
+
+    // Close normally removes the writer; drop it here too in case the unpack
+    // finished (tar end-marker) before the client's Close arrived.
+    {
+        let mut sess = session.lock().await;
+        sess.tcp_writers.remove(&conn_id);
+    }
+
+    match result {
+        Ok(()) => {
+            let _ = send_to_client(&Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await;
+            let _ = send_to_client(&Message::Close { conn_id }, &crypto, &session).await;
+            info!("[{}] PUSH complete", conn_id);
+        }
+        Err(message) => {
+            error!("[{}] PUSH failed: {}", conn_id, message);
+            let _ = send_to_client(
+                &Message::Error { conn_id: Some(conn_id), message },
+                &crypto,
+                &session,
+            )
+            .await;
+        }
+    }
 }
