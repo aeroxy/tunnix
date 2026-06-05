@@ -26,6 +26,11 @@ struct ChannelWriter {
 
 impl Write for ChannelWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Never enqueue an empty chunk: the reader treats an empty `Vec` as EOF,
+        // so a zero-length write must not reach the channel.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         // `blocking_send` is valid here because the writer only ever runs on a
         // `spawn_blocking` thread, never on the async runtime.
         self.tx
@@ -50,7 +55,15 @@ struct ChannelReader {
 
 impl Read for ChannelReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.leftover.len() {
+        // Loop so a transient empty chunk is skipped rather than mistaken for
+        // EOF: only a dropped sender (`None`) ends the stream.
+        loop {
+            if self.pos < self.leftover.len() {
+                let n = std::cmp::min(buf.len(), self.leftover.len() - self.pos);
+                buf[..n].copy_from_slice(&self.leftover[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
             match self.rx.blocking_recv() {
                 Some(chunk) => {
                     self.leftover = chunk;
@@ -59,10 +72,6 @@ impl Read for ChannelReader {
                 None => return Ok(0), // sender dropped => EOF
             }
         }
-        let n = std::cmp::min(buf.len(), self.leftover.len() - self.pos);
-        buf[..n].copy_from_slice(&self.leftover[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
     }
 }
 
