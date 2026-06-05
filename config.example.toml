@@ -36,6 +36,12 @@ password = "change-this-to-a-strong-password"
 # Can also be enabled with the server flag --allow-exec.
 # allow_exec = false
 
+# Allow `tunnix push` / `tunnix pull` to read and write files on THIS machine.
+# WARNING: anyone with the password can read or overwrite arbitrary files here.
+# Only enable on a box you control. Disabled by default.
+# Can also be enabled with the server flag --allow-transfer.
+# allow_transfer = false
+
 [client]
 # Server URL. If the server uses a path_prefix, include it here.
 # Examples:

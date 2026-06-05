@@ -69,6 +69,32 @@ It allocates a PTY on the server, so interactive programs (`vim`, `top`, `bash`)
 
 > ⚠️ **`--allow-exec` grants remote code execution.** Anyone holding the server password gets a shell on the host. The server prints a loud warning at startup when it's enabled. Only turn it on when you understand and accept that.
 
+## File Transfer (opt-in)
+
+`tunnix push` and `tunnix pull` upload and download files or directories over the same encrypted tunnel. The stream is packed into a tar archive and **zstd-compressed** before it's encrypted by the transport (compress-then-encrypt). Transfers are **disabled by default**; the server must be started with `--allow-transfer` (or `allow_transfer = true` in config) to authorize them.
+
+```bash
+# Server — must explicitly opt in
+tunnix server --listen 0.0.0.0:8080 --password "your-secret" --allow-transfer
+
+# Upload a local file or directory to a destination directory on the server
+tunnix push --server https://your-host.example.com --password "your-secret" ./localdir /remote/dir
+
+# Download a remote file or directory into a local destination directory
+tunnix pull --server https://your-host.example.com --password "your-secret" /remote/dir ./localdir
+
+# Multiple sources in one transfer — last arg is the destination directory (like `cp`)
+tunnix push -s https://your-host.example.com -p "your-secret" a.txt b.txt ./somedir /remote/dir
+tunnix pull -s https://your-host.example.com -p "your-secret" /remote/a /remote/b ./localdir
+
+# Tune compression (zstd level 1-22; default 3)
+tunnix push -s https://your-host.example.com -p "your-secret" --level 19 ./bigdir /remote/dir
+```
+
+Directories transfer recursively with permissions preserved (like `scp -r`). You can pass several sources in one command — the **last argument is always the destination directory**, the rest are sources. Each source's basename becomes its archive root, so `push ./foo /remote` lands as `/remote/foo/...` (sources sharing a basename collide — the later one wins).
+
+> ⚠️ **`--allow-transfer` grants arbitrary file read/write.** Anyone holding the server password can read or overwrite files on the host. The server prints a loud warning at startup when it's enabled.
+
 ## Deployment Scenarios
 
 ### Google Cloud Shell
@@ -183,6 +209,7 @@ listen = "0.0.0.0:8080"
 password = "your-secret"
 # path_prefix = "/tunnix"   # optional; leave empty for root
 # allow_exec = false        # opt-in remote shell (RCE) for `tunnix remote-exec`; Unix only
+# allow_transfer = false    # opt-in file read/write for `tunnix push` / `tunnix pull`
 
 [client]
 server_url = "https://your-host.example.com"
@@ -202,6 +229,16 @@ Run with a config file:
 tunnix server --config config.toml
 tunnix client --config config.toml
 ```
+
+### Config file resolution
+
+When `--config`/`-f` is not given, tunnix looks for a config file in this order and uses the first that exists:
+
+1. `--config <path>` / `-f <path>` — explicit path (must parse, or tunnix errors)
+2. `./config.toml` — in the current working directory
+3. `~/.config/tunnix/config.toml` — global per-user default (honors `$XDG_CONFIG_HOME`; same path on macOS and Linux)
+
+This applies to every subcommand, including `push` / `pull` and `remote-exec` — so you can keep your `server_url` and `password` in `~/.config/tunnix/config.toml` and run `tunnix push ./dir /remote/dir` from anywhere without flags. If none of the three exist, tunnix falls back to built-in defaults.
 
 CLI flags always override config file values. The password can also be supplied via the `TUNNIX_PASSWORD` environment variable.
 

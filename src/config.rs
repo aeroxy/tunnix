@@ -53,6 +53,12 @@ pub struct ServerConfig {
     /// remote code execution. Disabled by default.
     #[serde(default)]
     pub allow_exec: bool,
+
+    /// Allow file transfer (`tunnix push` / `tunnix pull`). This lets anyone
+    /// holding the password read and write arbitrary files on this machine.
+    /// Disabled by default.
+    #[serde(default)]
+    pub allow_transfer: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -134,6 +140,7 @@ impl Default for ServerConfig {
             root_html: None,
             health_response: default_health_response(),
             allow_exec: false,
+            allow_transfer: false,
         }
     }
 }

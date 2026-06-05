@@ -57,6 +57,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Encoding
 base64ct = { version = "1.6", features = ["alloc"] }
 
+# File transfer (push/pull): zstd-compressed tar streams
+zstd = "0.13"
+tar = "0.4"
+
 # Utilities
 futures = "0.3"
 bytes = "1.7"
