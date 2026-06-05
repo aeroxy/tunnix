@@ -25,9 +25,10 @@ pub async fn push(
 ) -> Result<()> {
     for local in &locals {
         // symlink_metadata (not exists) so broken symlinks pass — they're
-        // archived as links, consistent with follow_symlinks(false).
-        if local.symlink_metadata().is_err() {
-            bail!("local path does not exist: {}", local.display());
+        // archived as links, consistent with follow_symlinks(false). Propagate
+        // the real error so PermissionDenied etc. aren't masked as "not found".
+        if let Err(e) = local.symlink_metadata() {
+            bail!("cannot access local path {}: {}", local.display(), e);
         }
     }
     let conn_id = next_conn_id();
