@@ -24,7 +24,9 @@ pub async fn push(
     level: i32,
 ) -> Result<()> {
     for local in &locals {
-        if !local.exists() {
+        // symlink_metadata (not exists) so broken symlinks pass — they're
+        // archived as links, consistent with follow_symlinks(false).
+        if local.symlink_metadata().is_err() {
             bail!("local path does not exist: {}", local.display());
         }
     }

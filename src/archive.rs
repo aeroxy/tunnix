@@ -55,6 +55,11 @@ struct ChannelReader {
 
 impl Read for ChannelReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // A zero-length read must return immediately without blocking on the
+        // channel, per the `Read` contract.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         // Loop so a transient empty chunk is skipped rather than mistaken for
         // EOF: only a dropped sender (`None`) ends the stream.
         loop {
@@ -108,7 +113,10 @@ pub(crate) fn spawn_compress(
         builder.follow_symlinks(false);
 
         for src in &srcs {
-            let meta = std::fs::metadata(src)
+            // symlink_metadata (not metadata) so a symlinked root isn't
+            // dereferenced — matches builder.follow_symlinks(false), letting
+            // symlinks (including broken ones) be archived as links.
+            let meta = std::fs::symlink_metadata(src)
                 .with_context(|| format!("cannot read {}", src.display()))?;
             let name = archive_root_name(src);
             if meta.is_dir() {
