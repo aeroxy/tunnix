@@ -910,7 +910,14 @@ async fn relay_pty_connection(
                         let sess = session.lock().await;
                         sess.sse_tx.clone()
                     };
-                    if sse_tx.send(encrypted.clone()).await.is_ok() {
+                    // Bound each send: a half-open client keeps the old bounded
+                    // channel's receiver alive-but-undrained, so send() would
+                    // park forever and defeat the re-fetch above. On timeout,
+                    // fall through to re-lock and pick up a reconnected sender.
+                    if tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted.clone()))
+                        .await
+                        .is_ok_and(|r| r.is_ok())
+                    {
                         sent = true;
                         break;
                     }
@@ -957,7 +964,13 @@ async fn forward_pty_chunk(
             let sess = session.lock().await;
             sess.sse_tx.clone()
         };
-        if sse_tx.send(encrypted.clone()).await.is_ok() {
+        // Bound each send: a half-open client keeps the old bounded channel's
+        // receiver alive-but-undrained, so send() would park forever and defeat
+        // the re-fetch above. On timeout, fall through to pick up a reconnect.
+        if tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted.clone()))
+            .await
+            .is_ok_and(|r| r.is_ok())
+        {
             return true;
         }
         debug!("[{}] SSE stream replaced or closed; retrying", conn_id);
@@ -984,7 +997,13 @@ async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &
             let sess = session.lock().await;
             sess.sse_tx.clone()
         };
-        if sse_tx.send(encrypted.clone()).await.is_ok() {
+        // Bound each send: a half-open client keeps the old bounded channel's
+        // receiver alive-but-undrained, so send() would park forever and defeat
+        // the re-fetch above. On timeout, fall through to pick up a reconnect.
+        if tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted.clone()))
+            .await
+            .is_ok_and(|r| r.is_ok())
+        {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
