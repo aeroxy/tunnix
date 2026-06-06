@@ -372,8 +372,16 @@ async fn handle_send(
         }
         Message::Data { conn_id, data } => {
             debug!("[{}] DATA {} bytes from client", conn_id, data.len());
-            let sess = session.lock().await;
-            if let Some(tx) = sess.tcp_writers.get(&conn_id) {
+            // Clone the writer out and drop the session lock before awaiting the
+            // send. tx is a bounded channel, so holding the lock across
+            // tx.send().await would freeze every other session op — and deadlock
+            // the cleanup paths that need the lock to remove the writer —
+            // whenever the writer's consumer stalls.
+            let tx = {
+                let sess = session.lock().await;
+                sess.tcp_writers.get(&conn_id).cloned()
+            };
+            if let Some(tx) = tx {
                 let _ = tx.send(data).await;
             }
             ok_response("")
@@ -609,20 +617,30 @@ async fn relay_tcp_connection(
                         Err(e) => { error!("[{}] Encrypt: {}", conn_id, e); break; }
                     };
 
-                    let sse_tx = {
-                        let sess = session_clone.lock().await;
-                        sess.sse_tx.clone()
-                    };
-                    // Bound the send: a half-open client leaves the bounded SSE
-                    // channel full but undrained, so send() would park forever.
-                    // Timeout is treated like a send failure (drop + retry next
-                    // read) — consistent with the existing is_err path.
-                    if !tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted))
-                        .await
-                        .is_ok_and(|r| r.is_ok())
-                    {
-                        debug!("[{}] SSE stream replaced or closed, retrying in next read", conn_id);
+                    // Deliver this chunk to the (possibly reconnected) SSE
+                    // client, retrying across a reconnect. Never drop it: a gap
+                    // would corrupt the proxied TCP byte stream. Each send is
+                    // timeout-bounded so a half-open client (channel full but
+                    // undrained) can't park us forever; if it stays unreachable,
+                    // close the relay cleanly rather than skip bytes.
+                    let mut delivered = false;
+                    for _ in 0..50 {
+                        let sse_tx = {
+                            let sess = session_clone.lock().await;
+                            sess.sse_tx.clone()
+                        };
+                        if tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted.clone()))
+                            .await
+                            .is_ok_and(|r| r.is_ok())
+                        {
+                            delivered = true;
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    if !delivered {
+                        debug!("[{}] SSE unreachable; closing TCP relay", conn_id);
+                        break;
                     }
                 }
                 Err(e) => {

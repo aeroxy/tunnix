@@ -170,12 +170,13 @@ fn resolve_config_path(explicit: &Option<String>) -> Option<String> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Load config from file, then apply CLI overrides. An explicit -f path must
-    // parse (error otherwise); a discovered cwd/global file is best-effort.
+    // Load config from file, then apply CLI overrides. `resolve_config_path`
+    // only returns a discovered (cwd/global) path when the file exists, so any
+    // `from_file` failure is a parse/permission error worth surfacing rather
+    // than silently masking with defaults — propagate it for every resolved path.
     let config_path = resolve_config_path(&args.config);
     let mut config = match &config_path {
-        Some(path) if args.config.is_some() => Config::from_file(path)?,
-        Some(path) => Config::from_file(path).unwrap_or_default(),
+        Some(path) => Config::from_file(path)?,
         None => Config::default(),
     };
 
