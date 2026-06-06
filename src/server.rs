@@ -613,7 +613,14 @@ async fn relay_tcp_connection(
                         let sess = session_clone.lock().await;
                         sess.sse_tx.clone()
                     };
-                    if sse_tx.send(encrypted).await.is_err() {
+                    // Bound the send: a half-open client leaves the bounded SSE
+                    // channel full but undrained, so send() would park forever.
+                    // Timeout is treated like a send failure (drop + retry next
+                    // read) — consistent with the existing is_err path.
+                    if !tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted))
+                        .await
+                        .is_ok_and(|r| r.is_ok())
+                    {
                         debug!("[{}] SSE stream replaced or closed, retrying in next read", conn_id);
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
@@ -632,7 +639,9 @@ async fn relay_tcp_connection(
                     let sess = session_clone.lock().await;
                     sess.sse_tx.clone()
                 };
-                let _ = sse_tx.send(encrypted).await;
+                // Best-effort Close; bound it so a half-open client can't hang
+                // teardown on the full-but-undrained bounded channel.
+                let _ = tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted)).await;
             }
         }
         let mut sess = session_clone.lock().await;
@@ -727,7 +736,9 @@ async fn relay_pty_connection(
             };
             if let Ok(bytes) = msg.to_bytes() {
                 if let Ok(encrypted) = crypto.encrypt(&bytes) {
-                    let _ = sse_tx.send(encrypted).await;
+                    // Best-effort error report; bound it so a half-open client
+                    // can't hang on the full-but-undrained bounded channel.
+                    let _ = tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted)).await;
                 }
             }
             return;
