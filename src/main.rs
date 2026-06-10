@@ -205,13 +205,13 @@ async fn main() -> Result<()> {
         _ => Level::INFO,
     };
 
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stdout)
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
         .with_target(false);
 
     let registry = tracing_subscriber::registry()
         .with(tracing_subscriber::filter::LevelFilter::from_level(level))
-        .with(stdout_layer);
+        .with(stderr_layer);
 
     if let Some(ref log_path) = args.log {
         let log_file = std::fs::OpenOptions::new()
