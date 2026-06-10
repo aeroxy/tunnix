@@ -428,7 +428,7 @@ async fn main() -> Result<()> {
             let locals: Vec<std::path::PathBuf> = sources.iter().map(Into::into).collect();
             let tun = connect_transfer_tunnel(&mut config, ta.server, ta.password, ta.cookie).await?;
             transfer::push(tun, locals, dest.clone(), ta.level).await?;
-            println!("push complete");
+            eprintln!("push complete");
         }
 
         Command::Pull(ta) => {
@@ -436,7 +436,7 @@ async fn main() -> Result<()> {
             let (dest, sources) = ta.paths.split_last().unwrap();
             let tun = connect_transfer_tunnel(&mut config, ta.server, ta.password, ta.cookie).await?;
             transfer::pull(tun, sources.to_vec(), dest.into(), ta.level).await?;
-            println!("pull complete");
+            eprintln!("pull complete");
         }
     }
 
