@@ -327,11 +327,11 @@ impl Tunnel {
     pub async fn send_message(&self, msg: &Message) -> Result<Option<Vec<u8>>> {
         let hot = self.hot.load();
         let bytes = msg.to_bytes()?;
-        let encrypted = hot.crypto.encrypt(&bytes)?;
+        let encrypted = bytes::Bytes::from(hot.crypto.encrypt(&bytes)?);
 
         let sid = self.session_id.read().await.clone();
 
-        match self.try_post(&sid, &encrypted).await {
+        match self.try_post(&sid, encrypted.clone()).await {
             Ok(v) => Ok(v),
             Err(first_err) => {
                 // Any failure — including 503 "unknown session" after a
@@ -356,18 +356,18 @@ impl Tunnel {
                 // Re-read: the hot-reload watcher may have rotated the sid
                 // (password/header change) while we waited.
                 let sid = self.session_id.read().await.clone();
-                self.try_post(&sid, &encrypted).await
+                self.try_post(&sid, encrypted).await
             }
         }
     }
 
-    async fn try_post(&self, sid: &str, encrypted: &[u8]) -> Result<Option<Vec<u8>>> {
+    async fn try_post(&self, sid: &str, encrypted: bytes::Bytes) -> Result<Option<Vec<u8>>> {
         let hot = self.hot.load();
         let url = format!("{}/send/{}", hot.server_base_url, sid);
         let resp = hot
             .http_client
             .post(&url)
-            .body(encrypted.to_vec())
+            .body(encrypted)
             .send()
             .await?;
 
