@@ -11,6 +11,11 @@ use crate::protocol::Message;
 use crate::reload::{build_http_client, HotClientConfig};
 
 const RECONNECT_WAIT: Duration = Duration::from_secs(10);
+/// Bound on establishing the SSE GET (connect + response headers). The
+/// http_client has no global timeout (it would kill the streaming body), and
+/// a half-open pooled connection otherwise wedges `send().await` forever —
+/// the reconnect task is the only one, so the whole tunnel dies silently.
+const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Events received from server via SSE
 #[derive(Debug)]
@@ -124,13 +129,24 @@ impl Tunnel {
         let url = format!("{}/stream/{}", hot.server_base_url, *sid);
         info!("Opening SSE stream for session {} at {}", sid, hot.server_base_url);
         drop(sid);
-        let resp = hot.http_client.get(&url).send().await?;
+        // `send()` resolves at response headers, so this bounds only the
+        // connection setup, not the long-lived streaming body.
+        let resp = tokio::time::timeout(SSE_CONNECT_TIMEOUT, hot.http_client.get(&url).send())
+            .await
+            .map_err(|_| anyhow::anyhow!("SSE connect timed out after {:?}", SSE_CONNECT_TIMEOUT))??;
 
         if !resp.status().is_success() {
             anyhow::bail!("SSE stream failed: {}", resp.status());
         }
 
         info!("SSE stream connected");
+
+        // Drain any reconnect permit buffered while we were connecting
+        // (send_message fires notify_one on POST failure; if it fired during
+        // the GET above, the permit would otherwise tear down this freshly
+        // established stream on the first select! iteration).
+        use futures::FutureExt;
+        let _ = self.reconnect_signal.notified().now_or_never();
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
@@ -294,39 +310,41 @@ impl Tunnel {
         let bytes = msg.to_bytes()?;
         let encrypted = hot.crypto.encrypt(&bytes)?;
 
-        let initial_sid = self.session_id.read().await.clone();
+        let sid = self.session_id.read().await.clone();
 
-        match self.try_post(&encrypted).await {
+        match self.try_post(&sid, &encrypted).await {
             Ok(v) => Ok(v),
             Err(first_err) => {
-                let err_str = first_err.to_string();
-                if err_str.contains("unknown session") {
-                    let mut sid = self.session_id.write().await;
-                    if *sid == initial_sid {
-                        warn!("Server lost session; generating new session ID");
-                        *sid = format!("{:016x}", rand::random::<u64>());
-                        let mut channels = self.response_channels.lock().await;
-                        channels.clear();
-                    } else {
-                        debug!("Session already updated by another thread, skipping generation");
-                    }
-                }
-
+                // Any failure — including 503 "unknown session" after a
+                // server restart — is handled by forcing an SSE reconnect
+                // and retrying once. The session ID is deliberately NOT
+                // rotated: the server (re)creates the session on
+                // GET /stream/{sid}, and a genuinely fresh session announces
+                // itself with Reset, which clears stale conn state. Keeping
+                // the ID stable lets concurrent failures converge on one
+                // reconnect instead of racing to rotate (the old "death
+                // spiral"), and preserves in-flight server relays when the
+                // server didn't actually restart.
                 warn!("send failed: {}; forcing SSE reconnect and retrying", first_err);
+                // Register interest BEFORE signaling, so the SSE task can't
+                // win the race and fire sse_ready between notify_one and our
+                // first poll.
                 let ready = self.sse_ready.notified();
                 tokio::pin!(ready);
+                ready.as_mut().enable();
                 self.reconnect_signal.notify_one();
                 let _ = tokio::time::timeout(RECONNECT_WAIT, ready).await;
-                self.try_post(&encrypted).await
+                // Re-read: the hot-reload watcher may have rotated the sid
+                // (password/header change) while we waited.
+                let sid = self.session_id.read().await.clone();
+                self.try_post(&sid, &encrypted).await
             }
         }
     }
 
-    async fn try_post(&self, encrypted: &[u8]) -> Result<Option<Vec<u8>>> {
+    async fn try_post(&self, sid: &str, encrypted: &[u8]) -> Result<Option<Vec<u8>>> {
         let hot = self.hot.load();
-        let sid = self.session_id.read().await;
-        let url = format!("{}/send/{}", hot.server_base_url, *sid);
-        drop(sid);
+        let url = format!("{}/send/{}", hot.server_base_url, sid);
         let resp = hot
             .http_client
             .post(&url)
