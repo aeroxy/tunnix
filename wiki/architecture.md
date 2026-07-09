@@ -89,9 +89,11 @@ Each connection gets a unique `conn_id` used to demultiplex messages on the sing
 
 Maintains a long-lived SSE connection (`GET /stream/{session_id}`) for server-to-client messages. The SSE loop runs in a background task and uses a `tokio::select!` to interleave stream reads with a `reconnect_signal` (`Notify`), allowing `send_message` to force an immediate reconnect when a POST fails rather than waiting for the underlying TCP read to time out.
 
-`session_id` is stored in an `RwLock<String>` (not a plain `String`) so concurrent callers can read it without contention, and a single writer can rotate it atomically when the server reports an unknown session (HTTP 503). All pending `response_channels` are cleared at the same time.
+`session_id` is stored in an `RwLock<String>` (not a plain `String`) so concurrent callers can read it without contention, and the hot-reload watcher can rotate it atomically on a password/header change. It is deliberately **not** rotated when the server reports an unknown session (HTTP 503): the server (re)creates a session on `GET /stream/{sid}` and announces freshness with `Reset`, so recovery only needs a forced SSE reconnect. Keeping the ID stable lets concurrent send failures converge on one reconnect instead of racing to rotate (the old "death spiral"), and preserves in-flight server relays when the server didn't actually restart.
 
-`send_message` — tries `try_post` once; on failure it signals `reconnect_signal`, waits up to `RECONNECT_WAIT` for `sse_ready` (fired by the SSE loop on each fresh connection), then retries `try_post` once more.
+`send_message` — tries `try_post` once; on any failure it signals `reconnect_signal`, waits up to `RECONNECT_WAIT` for `sse_ready` (fired by the SSE loop on each fresh connection), then retries `try_post` once more.
+
+Establishing the SSE `GET` is bounded by a 15s timeout (`SSE_CONNECT_TIMEOUT`): the http_client has no global timeout (it would kill the streaming body), and a half-open pooled connection would otherwise wedge `send().await` forever — the reconnect task is the only one, so the whole tunnel would die silently. After each successful (re)connect, any `reconnect_signal` permit buffered during connection setup is drained so it can't tear down the freshly established stream.
 
 `send_connect()` — sends a `Connect` message and synchronously reads the **HTTP response body** as the ACK. This is distinct from the SSE stream; the ACK is the POST response, not an SSE event.
 
