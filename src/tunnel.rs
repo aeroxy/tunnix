@@ -10,12 +10,16 @@ use crate::crypto::Crypto;
 use crate::protocol::Message;
 use crate::reload::{build_http_client, HotClientConfig};
 
-const RECONNECT_WAIT: Duration = Duration::from_secs(10);
 /// Bound on establishing the SSE GET (connect + response headers). The
 /// http_client has no global timeout (it would kill the streaming body), and
 /// a half-open pooled connection otherwise wedges `send().await` forever —
 /// the reconnect task is the only one, so the whole tunnel dies silently.
 const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Time send_message waits for the SSE stream to become ready after forcing
+/// a reconnect. Must exceed SSE_CONNECT_TIMEOUT (15s): the GET alone can take
+/// that long under network congestion, and this also covers first-frame
+/// processing before sse_ready fires.
+const RECONNECT_WAIT: Duration = Duration::from_secs(20);
 
 /// Events received from server via SSE
 #[derive(Debug)]
@@ -94,7 +98,7 @@ impl Tunnel {
             // `register_connection` lands. On reconnects, the server won't send
             // a Reset and the first event may be a keepalive comment; in that
             // case signal on any event to avoid stalling `send_message`'s
-            // retry for the full RECONNECT_WAIT (10s) timeout.
+            // retry for the full RECONNECT_WAIT timeout.
             let mut is_reconnect = false;
             loop {
                 let res = tunnel_clone.sse_read_loop(is_reconnect).await;
@@ -115,8 +119,8 @@ impl Tunnel {
         // Wait for the stream to actually establish — the server creates the
         // session when it handles GET /stream, so the first POST /send must not
         // race ahead of it (otherwise: 503 "unknown session").
-        if tokio::time::timeout(Duration::from_secs(10), ready).await.is_err() {
-            warn!("SSE stream not ready after 10s; proceeding anyway");
+        if tokio::time::timeout(RECONNECT_WAIT, ready).await.is_err() {
+            warn!("SSE stream not ready after {:?}; proceeding anyway", RECONNECT_WAIT);
         }
 
         Ok(tunnel)
@@ -128,6 +132,7 @@ impl Tunnel {
         let sid = self.session_id.read().await;
         let url = format!("{}/stream/{}", hot.server_base_url, *sid);
         info!("Opening SSE stream for session {} at {}", sid, hot.server_base_url);
+        let captured_sid = sid.clone();
         drop(sid);
         // `send()` resolves at response headers, so this bounds only the
         // connection setup, not the long-lived streaming body.
@@ -145,8 +150,22 @@ impl Tunnel {
         // (send_message fires notify_one on POST failure; if it fired during
         // the GET above, the permit would otherwise tear down this freshly
         // established stream on the first select! iteration).
-        use futures::FutureExt;
-        let _ = self.reconnect_signal.notified().now_or_never();
+        //
+        // Only drain if the session_id hasn't changed: the config watcher
+        // rotates the session_id *before* firing reconnect_signal, so a
+        // changed sid means its permit is in-flight and must NOT be consumed
+        // (otherwise the stream stays on the old session). Holding the read
+        // lock during the drain prevents the config watcher from rotating
+        // mid-check, since it needs the write lock first.
+        let current_sid = self.session_id.read().await;
+        if *current_sid == captured_sid {
+            use futures::FutureExt;
+            let _ = self.reconnect_signal.notified().now_or_never();
+        } else {
+            drop(current_sid);
+            anyhow::bail!("forced reconnect");
+        }
+        drop(current_sid);
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
@@ -163,7 +182,7 @@ impl Tunnel {
         //
         // On reconnects the server won't queue a Reset, so the first event may
         // be a keepalive; signal on any event to avoid stalling send_message
-        // for the full RECONNECT_WAIT (10s) timeout.
+        // for the full RECONNECT_WAIT timeout.
         let mut signaled_ready = false;
 
         loop {
@@ -205,7 +224,7 @@ impl Tunnel {
                             // Keepalive comment — the stream is up and the
                             // server is not going to send a Reset. Notify
                             // send_message's retry path so it doesn't burn
-                            // the full 10s RECONNECT_WAIT.
+                            // the full RECONNECT_WAIT.
                             self.sse_ready.notify_waiters();
                             signaled_ready = true;
                         }
