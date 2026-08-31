@@ -215,14 +215,15 @@ password = "your-secret"
 server_url = "https://your-host.example.com"
 password = "your-secret"
 local_addr = "127.0.0.1:7890"
-
-[client.headers]
-# Cookie = "..."   # only needed for cookie-authenticated hosts
+# Ordered pairs preserve repeated field lines.
+headers = [["Cookie", "..."]] # only needed for cookie-authenticated hosts
 
 [logging]
 level = "info"
 # file = "./tunnix.log"
 ```
+
+The ordered `headers = [[name, value], ...]` form replaces the legacy `[client.headers]` table so repeated field lines, original casing, and global order can be retained.
 
 Run with a config file:
 ```bash
@@ -232,7 +233,7 @@ tunnix client --config config.toml
 
 ### Config file resolution
 
-When `--config`/`-f` is not given, tunnix looks for a config file in this order and uses the first that exists:
+Tunnix resolves its config in this order and uses the first applicable path:
 
 1. `--config <path>` / `-f <path>` — explicit path (must parse, or tunnix errors)
 2. `./config.toml` — in the current working directory
@@ -242,7 +243,7 @@ This applies to every subcommand, including `push` / `pull` and `remote-exec` �
 
 CLI flags always override config file values. The password can also be supplied via the `TUNNIX_PASSWORD` environment variable.
 
-Changes to `config.toml` are picked up automatically every few seconds — no restart needed. Hot-reloadable fields: `password`, `headers`, `path_prefix`, `root_redirect`, `root_html`, `health_response`. Fields that require a restart: `listen`, `local_addr`, `server_url`, `logging.level`. CLI overrides are never clobbered by file changes.
+Changes to the selected config file are picked up automatically every few seconds — no restart needed. Hot-reloadable fields: `password`, `headers`, `server_url`, `path_prefix`, `root_redirect`, `root_html`, `health_response`, `allow_exec`, and `allow_transfer`. Fields that require a restart: `listen`, `local_addr`, `logging.level`. CLI overrides are never clobbered by file changes.
 
 ## Building
 
@@ -270,9 +271,8 @@ Local SOCKS5/HTTP client
         │
         ▼
   tunnix client
-  ├── proxy.rs       — TCP listener; detects protocol (0x05=SOCKS5, letter=HTTP)
-  ├── socks5.rs      — SOCKS5 handshake (RFC 1928, CONNECT only)
-  ├── http_proxy.rs  — HTTP CONNECT + plain HTTP forwarding
+  ├── proxy.rs       — Rama SOCKS5/HTTP listener, CONNECT and plain HTTP proxy
+  ├── tunnel_connector.rs — adapts Rama connections to the encrypted envelope
   ├── relay.rs       — bidirectional relay; connection ID counter
   ├── exec.rs        — remote-exec client: raw terminal + PTY stream (Unix)
   └── tunnel.rs      — HTTP/SSE tunnel to server
@@ -281,23 +281,22 @@ Local SOCKS5/HTTP client
           │  GET  /[prefix]/stream/{session}  SSE text/event-stream
           ▼
   tunnix server
-  └── server.rs      — hyper HTTP/1.1 server; session routing; prefix stripping
+  └── server.rs      — Rama HTTP server; session routing; prefix stripping
           │
           │  raw TCP
           ▼
   Target (e.g. api.example.com:443)
 ```
 
-The client auto-detects the incoming protocol by peeking the first byte:
-- `0x05` → SOCKS5
-- ASCII letter → HTTP proxy (`CONNECT` for HTTPS, method for plain HTTP)
+Rama's generic replaying `PeekRouter` recognizes the SOCKS5 version byte without consuming it and otherwise routes the connection to Rama's HTTP server. This works around a Rama 0.4 `Socks5PeekRouter` greeting bug; Rama's `Socks5Acceptor` still validates the complete greeting. Rama handles SOCKS5 negotiation, HTTP routing, SSE framing, CONNECT upgrades, HTTP version adaptation, graceful shutdown, and hop-by-hop headers; tunnix's custom encrypted envelope remains unchanged.
 
 ## Security
 
 - Argon2id key derivation from the shared password
-- ChaCha20-Poly1305 AEAD, per-message random nonce
+- ChaCha20-Poly1305 AEAD, per-message nonce combining a monotonic counter and randomness
 - No plaintext payload logging
 - Use a strong, randomly generated password — it is the only credential
+- HTTPS certificate verification is currently disabled for compatibility with existing TLS-inspecting deployments; a follow-up should make normal roots the default and require an explicit custom-CA or insecure mode.
 - **Remote exec is off by default.** `--allow-exec` (server) grants a shell to anyone with the password — effectively full RCE on the host. Leave it disabled unless you explicitly need it.
 
 ## Use with Clash / ClashX

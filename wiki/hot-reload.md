@@ -6,14 +6,14 @@ Runtime config reload without process restart.
 
 ## How it works
 
-A background task polls `config.toml` mtime every 3 seconds. On change, it waits 200ms (debounce for editors that truncate-then-write), re-parses the file, and swaps the affected fields atomically via `ArcSwap`. If the parse fails, it retries once after 500ms, then skips that cycle — the process continues with the last good config.
+A background task polls the selected config file's mtime every 3 seconds. On change, it waits 200ms (debounce for editors that truncate-then-write), re-parses the file, and swaps the affected fields atomically via `ArcSwap`. If the parse fails, it retries once after 500ms, then skips that cycle — the process continues with the last good config.
 
 The hot config is split into two structs behind `ArcSwap`:
 
-- **Server**: `HotServerConfig` — `crypto`, `path_prefix`, `root_redirect`, `root_html`, `health_body`
-- **Client**: `HotClientConfig` — `crypto`, `http_client`
+- **Server**: `HotServerConfig` — `crypto`, `path_prefix`, `root_redirect`, `root_html`, `health_body`, `allow_exec`, `allow_transfer`
+- **Client**: `HotClientConfig` — `crypto`, Rama HTTP client, headers, typed server URI
 
-Handlers load a snapshot (`ArcSwap::load()`) at the top of each request. A config swap mid-request is invisible — the request finishes with the snapshot it started with.
+Every `ArcSwap::load()` returns one internally consistent snapshot. Most request phases retain that snapshot, while a later phase may deliberately load again and observe a just-reloaded config; no phase can observe a partially updated `HotServerConfig` or `HotClientConfig`.
 
 ---
 
@@ -22,11 +22,14 @@ Handlers load a snapshot (`ArcSwap::load()`) at the top of each request. A confi
 | Field | Server | Client | Notes |
 |-------|--------|--------|-------|
 | `password` | Yes | Yes | Argon2id derivation runs in `spawn_blocking` |
-| `headers` | — | Yes | Rebuilds `reqwest::Client` with new default headers |
+| `headers` | — | Yes | Replaces the validated Rama `HeaderMap` and reconnects |
+| `server_url` | — | Yes | Replaces the typed Rama URI and reconnects |
 | `path_prefix` | Yes | — | |
 | `root_redirect` | Yes | — | |
 | `root_html` | Yes | — | |
 | `health_response` | Yes | — | |
+| `allow_exec` | Yes | — | A CLI `--allow-exec` remains authoritative |
+| `allow_transfer` | Yes | — | A CLI `--allow-transfer` remains authoritative |
 
 ## What requires a restart
 
@@ -34,7 +37,6 @@ Handlers load a snapshot (`ArcSwap::load()`) at the top of each request. A confi
 |-------|-----|
 | `server.listen` | TCP listener is already bound |
 | `client.local_addr` | SOCKS5/HTTP listener is already bound |
-| `client.server_url` | Would need to reconnect to a different server entirely |
 | `logging.level` | Tracing subscriber is initialized once at startup |
 
 ---
@@ -55,7 +57,7 @@ Handlers load a snapshot (`ArcSwap::load()`) at the top of each request. A confi
 
 ## Header change behavior (client only)
 
-A new `reqwest::Client` is built with the updated `HeaderMap` and swapped in alongside the existing crypto. The SSE loop reconnects with the new client, sending the updated headers on all subsequent requests.
+Headers deserialize directly into Rama's typed `HeaderMap` from an ordered list of `[name, value]` pairs. Repeated field lines, insertion order, and original name casing are retained; any ordered change swaps the map and reconnects the SSE loop.
 
 ---
 

@@ -3,8 +3,8 @@ use argon2::{
     Argon2, ParamsBuilder, Version,
 };
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
-    ChaCha20Poly1305, Nonce,
+    aead::{AeadInPlace, KeyInit, OsRng},
+    ChaCha20Poly1305, Nonce, Tag,
 };
 use rand::RngCore;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,10 +39,13 @@ impl Crypto {
     pub fn new(password: &str) -> Result<Self, CryptoError> {
         let key = Self::derive_key(password)?;
         let cipher = ChaCha20Poly1305::new(&key.into());
+        let initial_nonce_counter = OsRng.next_u64();
 
         Ok(Self {
             cipher,
-            nonce_counter: AtomicU64::new(0),
+            // A random starting point keeps equal counter positions across
+            // process restarts and hot-reloaded Crypto instances distinct.
+            nonce_counter: AtomicU64::new(initial_nonce_counter),
         })
     }
 
@@ -54,8 +57,8 @@ impl Crypto {
 
         let params = ParamsBuilder::new()
             .m_cost(19456) // 19 MB memory
-            .t_cost(2)     // 2 iterations
-            .p_cost(1)     // 1 thread
+            .t_cost(2) // 2 iterations
+            .p_cost(1) // 1 thread
             .build()
             .map_err(|e| CryptoError::KeyDerivationFailed(e.to_string()))?;
 
@@ -94,15 +97,14 @@ impl Crypto {
         let nonce_bytes = self.generate_nonce();
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self
-            .cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|_| CryptoError::EncryptionFailed)?;
-
-        // Prepend nonce to ciphertext
-        let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+        let mut result = Vec::with_capacity(NONCE_SIZE + plaintext.len() + TAG_SIZE);
         result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&ciphertext);
+        result.extend_from_slice(plaintext);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(nonce, b"", &mut result[NONCE_SIZE..])
+            .map_err(|_| CryptoError::EncryptionFailed)?;
+        result.extend_from_slice(&tag);
 
         Ok(result)
     }
@@ -115,27 +117,23 @@ impl Crypto {
             return Err(CryptoError::InvalidNonce);
         }
 
-        let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
+        let (nonce_bytes, ciphertext_and_tag) = data.split_at(NONCE_SIZE);
+        let (ciphertext, tag) = ciphertext_and_tag.split_at(ciphertext_and_tag.len() - TAG_SIZE);
         let nonce = Nonce::from_slice(nonce_bytes);
 
-        let plaintext = self
-            .cipher
-            .decrypt(nonce, ciphertext)
+        let mut plaintext = ciphertext.to_vec();
+        self.cipher
+            .decrypt_in_place_detached(nonce, b"", &mut plaintext, Tag::from_slice(tag))
             .map_err(|_| CryptoError::DecryptionFailed)?;
 
         Ok(plaintext)
     }
 }
 
-impl Drop for Crypto {
-    fn drop(&mut self) {
-        // Zeroize is handled by ChaCha20Poly1305's Drop impl
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chacha20poly1305::aead::Aead;
 
     #[test]
     fn test_key_derivation() {
@@ -202,5 +200,30 @@ mod tests {
         // But both should decrypt to same plaintext
         assert_eq!(crypto.decrypt(&encrypted1).unwrap(), plaintext);
         assert_eq!(crypto.decrypt(&encrypted2).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_in_place_frame_matches_the_existing_aead_wire_format() {
+        let crypto = Crypto::new("test-password").unwrap();
+        let plaintext = b"wire-compatible payload";
+
+        let encrypted = crypto.encrypt(plaintext).unwrap();
+        let (nonce, ciphertext_and_tag) = encrypted.split_at(NONCE_SIZE);
+        assert_eq!(
+            crypto
+                .cipher
+                .decrypt(Nonce::from_slice(nonce), ciphertext_and_tag)
+                .unwrap(),
+            plaintext
+        );
+
+        let nonce = [7; NONCE_SIZE];
+        let legacy = crypto
+            .cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
+            .unwrap();
+        let mut legacy_frame = nonce.to_vec();
+        legacy_frame.extend_from_slice(&legacy);
+        assert_eq!(crypto.decrypt(&legacy_frame).unwrap(), plaintext);
     }
 }

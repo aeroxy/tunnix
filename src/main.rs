@@ -3,29 +3,41 @@ mod config;
 mod crypto;
 #[cfg(unix)]
 mod exec;
-mod http_proxy;
 mod protocol;
 mod proxy;
 mod relay;
 mod reload;
 mod server;
-mod socks5;
 mod transfer;
 mod tunnel;
+mod tunnel_connector;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use rama::{
+    graceful::Shutdown,
+    http::{header::COOKIE, HeaderMap, HeaderValue},
+    net::{address::SocketAddress, uri::Uri},
+    rt::Executor,
+    telemetry::tracing::{
+        self, info,
+        level_filters::LevelFilter,
+        subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt},
+        warn, Level,
+    },
+};
 use std::sync::Arc;
-use tracing::{info, warn, Level};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::config::Config;
+use crate::config::{normalize_path_prefix, normalize_server_url, Config};
 use crate::crypto::Crypto;
 use crate::reload::{CliOverrides, HotServerConfig};
 
 #[derive(Parser, Debug)]
-#[command(name = "tunnix", version, about = "encrypted proxy tunnel over HTTP/SSE")]
+#[command(
+    name = "tunnix",
+    version,
+    about = "encrypted proxy tunnel over HTTP/SSE"
+)]
 struct Args {
     /// Config file path
     #[arg(short = 'f', long, global = true)]
@@ -62,7 +74,7 @@ enum Command {
 struct ServerArgs {
     /// Address to listen on (overrides config)
     #[arg(short, long)]
-    listen: Option<String>,
+    listen: Option<SocketAddress>,
 
     /// Password for encryption (overrides config)
     #[arg(short, long, env = "TUNNIX_PASSWORD")]
@@ -81,7 +93,7 @@ struct ServerArgs {
 struct ClientArgs {
     /// Server URL (overrides config)
     #[arg(short, long)]
-    server: Option<String>,
+    server: Option<Uri>,
 
     /// Password for encryption (overrides config)
     #[arg(short, long, env = "TUNNIX_PASSWORD")]
@@ -89,7 +101,7 @@ struct ClientArgs {
 
     /// Local proxy address for SOCKS5 + HTTP (overrides config)
     #[arg(short, long)]
-    local_addr: Option<String>,
+    local_addr: Option<SocketAddress>,
 
     /// Custom cookie header (overrides config)
     #[arg(short, long)]
@@ -101,7 +113,7 @@ struct ClientArgs {
 struct RemoteExecArgs {
     /// Server URL (overrides config)
     #[arg(short, long)]
-    server: Option<String>,
+    server: Option<Uri>,
 
     /// Password for encryption (overrides config)
     #[arg(short, long, env = "TUNNIX_PASSWORD")]
@@ -120,7 +132,7 @@ struct RemoteExecArgs {
 struct TransferArgs {
     /// Server URL (overrides config)
     #[arg(short, long)]
-    server: Option<String>,
+    server: Option<Uri>,
 
     /// Password for encryption (overrides config)
     #[arg(short, long, env = "TUNNIX_PASSWORD")]
@@ -205,12 +217,10 @@ async fn main() -> Result<()> {
         _ => Level::INFO,
     };
 
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_target(false);
+    let stderr_layer = fmt::layer().with_writer(std::io::stderr).with_target(false);
 
-    let registry = tracing_subscriber::registry()
-        .with(tracing_subscriber::filter::LevelFilter::from_level(level))
+    let registry = tracing::subscriber::registry()
+        .with(LevelFilter::from_level(level))
         .with(stderr_layer);
 
     if let Some(ref log_path) = args.log {
@@ -218,7 +228,7 @@ async fn main() -> Result<()> {
             .create(true)
             .append(true)
             .open(log_path)?;
-        let file_layer = tracing_subscriber::fmt::layer()
+        let file_layer = fmt::layer()
             .with_writer(log_file)
             .with_target(false)
             .with_ansi(false);
@@ -255,13 +265,17 @@ async fn main() -> Result<()> {
             }
 
             if let Some(ref log_path) = args.log {
-                info!("Log file: {}", log_path);
+                info!(path = %log_path, "file logging enabled");
             }
 
-            info!("tunnix server v{}", env!("CARGO_PKG_VERSION"));
-            info!("Listening on: {}", config.server.listen);
-            if !config.server.path_prefix.is_empty() {
-                info!("Path prefix: {}", config.server.path_prefix);
+            info!(
+                version = env!("CARGO_PKG_VERSION"),
+                "tunnix server starting"
+            );
+            info!(listen_addr = %config.server.listen, "server configured");
+            let path_prefix = normalize_path_prefix(config.server.path_prefix.as_ref())?;
+            if let Some(prefix) = &path_prefix {
+                info!(path_prefix = %prefix, "server path prefix configured");
             }
             if config.server.allow_exec {
                 warn!("Remote command execution ENABLED — anyone with the password can run a shell on this machine");
@@ -271,11 +285,11 @@ async fn main() -> Result<()> {
             }
 
             let crypto = Arc::new(Crypto::new(&config.server.password)?);
-            info!("Encryption initialized");
+            info!("encryption initialized");
 
             let hot = HotServerConfig {
                 crypto,
-                path_prefix: config.server.path_prefix.trim_end_matches('/').to_string(),
+                path_prefix,
                 root_redirect: config.server.root_redirect.clone(),
                 root_html: config.server.root_html.clone(),
                 health_body: config.server.health_response.clone(),
@@ -283,13 +297,7 @@ async fn main() -> Result<()> {
                 allow_transfer: config.server.allow_transfer,
             };
 
-            server::run_server(
-                &config.server.listen,
-                hot,
-                config_path,
-                cli_overrides,
-            )
-            .await?;
+            server::run_server(config.server.listen, hot, config_path, cli_overrides).await?;
         }
 
         Command::Client(ca) => {
@@ -302,7 +310,7 @@ async fn main() -> Result<()> {
             });
 
             if let Some(server) = ca.server {
-                config.client.server_url = server;
+                config.client.server_url = Some(server);
             }
             if let Some(password) = ca.password {
                 config.client.password = password;
@@ -311,37 +319,46 @@ async fn main() -> Result<()> {
                 config.client.local_addr = local_addr;
             }
             if let Some(cookie) = ca.cookie {
-                config.client.headers.insert("Cookie".to_string(), cookie);
+                set_cookie(&mut config.client.headers, cookie)?;
             }
 
-            if config.client.server_url.is_empty() {
-                bail!("Server URL is required. Set via --server or config file.");
-            }
+            let server_url = required_server_url(&mut config)?;
             if config.client.password.is_empty() {
                 bail!("Password is required. Set via --password, TUNNIX_PASSWORD env var, or config file.");
             }
 
             // Install rustls crypto provider
-            rustls::crypto::ring::default_provider()
+            rama::tls::rustls::dep::rustls::crypto::ring::default_provider()
                 .install_default()
                 .expect("Failed to install rustls crypto provider");
 
             if let Some(ref log_path) = args.log {
-                info!("Log file: {}", log_path);
+                info!(path = %log_path, "file logging enabled");
             }
 
-            info!("tunnix client v{}", env!("CARGO_PKG_VERSION"));
-            info!("Server: {}", config.client.server_url);
-            info!("Proxy (SOCKS5 + HTTP): {}", config.client.local_addr);
+            info!(
+                version = env!("CARGO_PKG_VERSION"),
+                "tunnix client starting"
+            );
+            info!(server_url = %server_url, "tunnel server configured");
+            info!(
+                local_addr = %config.client.local_addr,
+                protocols = "socks5,http",
+                "proxy configured"
+            );
 
             let crypto = Arc::new(Crypto::new(&config.client.password)?);
-            info!("Encryption initialized");
+            info!("encryption initialized");
+
+            let shutdown = Shutdown::default();
+            let exec = Executor::graceful(shutdown.guard());
 
             let tun = tunnel::Tunnel::connect(
-                &config.client.server_url,
+                &server_url,
                 crypto,
                 &config.client.headers,
                 &config.client.health_expected,
+                exec.clone(),
             )
             .await?;
 
@@ -353,7 +370,7 @@ async fn main() -> Result<()> {
                 let session_id = tun.session_id.clone();
                 let channels = tun.response_channels.clone();
                 let overrides = cli_overrides.clone();
-                tokio::spawn(async move {
+                exec.spawn_cancellable_task(async move {
                     reload::config_watcher_client(
                         path, hot, reconnect, session_id, channels, overrides,
                     )
@@ -361,39 +378,38 @@ async fn main() -> Result<()> {
                 });
             }
 
-            proxy::run_proxy(&config.client.local_addr, tun).await?;
+            proxy::run_proxy(config.client.local_addr, tun, exec, shutdown).await?;
         }
 
         #[cfg(unix)]
         Command::RemoteExec(ra) => {
             if let Some(server) = ra.server {
-                config.client.server_url = server;
+                config.client.server_url = Some(server);
             }
             if let Some(password) = ra.password {
                 config.client.password = password;
             }
             if let Some(cookie) = ra.cookie {
-                config.client.headers.insert("Cookie".to_string(), cookie);
+                set_cookie(&mut config.client.headers, cookie)?;
             }
 
-            if config.client.server_url.is_empty() {
-                bail!("Server URL is required. Set via --server or config file.");
-            }
+            let server_url = required_server_url(&mut config)?;
             if config.client.password.is_empty() {
                 bail!("Password is required. Set via --password, TUNNIX_PASSWORD env var, or config file.");
             }
 
-            rustls::crypto::ring::default_provider()
+            rama::tls::rustls::dep::rustls::crypto::ring::default_provider()
                 .install_default()
                 .expect("Failed to install rustls crypto provider");
 
             let crypto = Arc::new(Crypto::new(&config.client.password)?);
 
             let tun = tunnel::Tunnel::connect(
-                &config.client.server_url,
+                &server_url,
                 crypto,
                 &config.client.headers,
                 &config.client.health_expected,
+                Executor::default(),
             )
             .await?;
 
@@ -426,7 +442,8 @@ async fn main() -> Result<()> {
             // Last path is the remote destination directory; the rest are local sources.
             let (dest, sources) = ta.paths.split_last().unwrap();
             let locals: Vec<std::path::PathBuf> = sources.iter().map(Into::into).collect();
-            let tun = connect_transfer_tunnel(&mut config, ta.server, ta.password, ta.cookie).await?;
+            let tun =
+                connect_transfer_tunnel(&mut config, ta.server, ta.password, ta.cookie).await?;
             transfer::push(tun, locals, dest.clone(), ta.level).await?;
             eprintln!("push complete");
         }
@@ -434,7 +451,8 @@ async fn main() -> Result<()> {
         Command::Pull(ta) => {
             // Last path is the local destination directory; the rest are remote sources.
             let (dest, sources) = ta.paths.split_last().unwrap();
-            let tun = connect_transfer_tunnel(&mut config, ta.server, ta.password, ta.cookie).await?;
+            let tun =
+                connect_transfer_tunnel(&mut config, ta.server, ta.password, ta.cookie).await?;
             transfer::pull(tun, sources.to_vec(), dest.into(), ta.level).await?;
             eprintln!("pull complete");
         }
@@ -447,38 +465,51 @@ async fn main() -> Result<()> {
 /// one-shot transfer. Shared by `push` and `pull`.
 async fn connect_transfer_tunnel(
     config: &mut Config,
-    server: Option<String>,
+    server: Option<Uri>,
     password: Option<String>,
     cookie: Option<String>,
 ) -> Result<Arc<tunnel::Tunnel>> {
     if let Some(server) = server {
-        config.client.server_url = server;
+        config.client.server_url = Some(server);
     }
     if let Some(password) = password {
         config.client.password = password;
     }
     if let Some(cookie) = cookie {
-        config.client.headers.insert("Cookie".to_string(), cookie);
+        set_cookie(&mut config.client.headers, cookie)?;
     }
 
-    if config.client.server_url.is_empty() {
-        bail!("Server URL is required. Set via --server or config file.");
-    }
+    let server_url = required_server_url(config)?;
     if config.client.password.is_empty() {
         bail!("Password is required. Set via --password, TUNNIX_PASSWORD env var, or config file.");
     }
 
-    rustls::crypto::ring::default_provider()
+    rama::tls::rustls::dep::rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
     let crypto = Arc::new(Crypto::new(&config.client.password)?);
 
     tunnel::Tunnel::connect(
-        &config.client.server_url,
+        &server_url,
         crypto,
         &config.client.headers,
         &config.client.health_expected,
+        Executor::default(),
     )
     .await
+}
+
+fn required_server_url(config: &mut Config) -> Result<Uri> {
+    let url = config.client.server_url.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("Server URL is required. Set via --server or config file.")
+    })?;
+    let url = normalize_server_url(url)?;
+    config.client.server_url = Some(url.clone());
+    Ok(url)
+}
+
+fn set_cookie(headers: &mut HeaderMap, cookie: String) -> Result<()> {
+    headers.insert(COOKIE, HeaderValue::try_from(cookie)?);
+    Ok(())
 }

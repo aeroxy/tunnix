@@ -48,7 +48,10 @@ async fn push_session(
 ) -> Result<()> {
     // Announce the upload; the server replies with an empty Data ACK on success
     // or an Error (e.g. transfers disabled) which we surface before streaming.
-    let msg = Message::Push { conn_id, path: remote };
+    let msg = Message::Push {
+        conn_id,
+        path: remote,
+    };
     if let Some(Message::Error { message, .. }) = tunnel.send_connect(&msg).await? {
         bail!("{}", message);
     }
@@ -89,7 +92,9 @@ async fn push_session(
     loop {
         match event_rx.recv().await {
             Some(TunnelEvent::Exit(0)) => return Ok(()),
-            Some(TunnelEvent::Exit(code)) => bail!("server reported transfer failure (exit {})", code),
+            Some(TunnelEvent::Exit(code)) => {
+                bail!("server reported transfer failure (exit {})", code)
+            }
             Some(TunnelEvent::Error(m)) => bail!("remote error: {}", m),
             Some(TunnelEvent::Close) | None => {
                 bail!("connection closed before the server confirmed the transfer")
@@ -122,7 +127,11 @@ async fn pull_session(
     local: PathBuf,
     level: i32,
 ) -> Result<()> {
-    let msg = Message::Pull { conn_id, paths: remotes, level };
+    let msg = Message::Pull {
+        conn_id,
+        paths: remotes,
+        level,
+    };
     if let Some(Message::Error { message, .. }) = tunnel.send_connect(&msg).await? {
         bail!("{}", message);
     }

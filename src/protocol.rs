@@ -11,15 +11,10 @@ pub enum Message {
     },
 
     /// Encrypted data payload
-    Data {
-        conn_id: u32,
-        data: Vec<u8>,
-    },
+    Data { conn_id: u32, data: Vec<u8> },
 
     /// Close specific connection
-    Close {
-        conn_id: u32,
-    },
+    Close { conn_id: u32 },
 
     /// Keep-alive ping
     Ping,
@@ -53,17 +48,10 @@ pub enum Message {
     },
 
     /// Client's terminal was resized; server applies the new size to the PTY.
-    Resize {
-        conn_id: u32,
-        cols: u16,
-        rows: u16,
-    },
+    Resize { conn_id: u32, cols: u16, rows: u16 },
 
     /// Server reports the child process exit code (sent just before Close).
-    ExitStatus {
-        conn_id: u32,
-        code: i32,
-    },
+    ExitStatus { conn_id: u32, code: i32 },
 
     /// Client asks to download `paths` (files or dirs) from the server. The
     /// server streams them back as a single zstd-compressed tar archive over
@@ -78,10 +66,7 @@ pub enum Message {
     /// server. The client then streams a zstd-compressed tar archive over Data
     /// messages and a final Close. The server reports completion with
     /// ExitStatus + Close (or Error on failure).
-    Push {
-        conn_id: u32,
-        path: String,
-    },
+    Push { conn_id: u32, path: String },
 }
 
 impl Message {
@@ -112,7 +97,11 @@ mod tests {
         let decoded = Message::from_bytes(&bytes).unwrap();
 
         match decoded {
-            Message::Connect { conn_id, host, port } => {
+            Message::Connect {
+                conn_id,
+                host,
+                port,
+            } => {
                 assert_eq!(conn_id, 123);
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 443);
@@ -133,7 +122,10 @@ mod tests {
         let decoded = Message::from_bytes(&bytes).unwrap();
 
         match decoded {
-            Message::Data { conn_id, data: decoded_data } => {
+            Message::Data {
+                conn_id,
+                data: decoded_data,
+            } => {
                 assert_eq!(conn_id, 456);
                 assert_eq!(decoded_data, data);
             }
@@ -155,17 +147,48 @@ mod tests {
     #[test]
     fn test_exec_messages() {
         for msg in [
-            Message::Exec { conn_id: 7, cmd: Some("ls /home".into()), cols: 80, rows: 24, term: "xterm-256color".into() },
-            Message::Exec { conn_id: 8, cmd: None, cols: 120, rows: 40, term: "screen-256color".into() },
-            Message::Resize { conn_id: 7, cols: 100, rows: 30 },
-            Message::ExitStatus { conn_id: 7, code: 42 },
+            Message::Exec {
+                conn_id: 7,
+                cmd: Some("ls /home".into()),
+                cols: 80,
+                rows: 24,
+                term: "xterm-256color".into(),
+            },
+            Message::Exec {
+                conn_id: 8,
+                cmd: None,
+                cols: 120,
+                rows: 40,
+                term: "screen-256color".into(),
+            },
+            Message::Resize {
+                conn_id: 7,
+                cols: 100,
+                rows: 30,
+            },
+            Message::ExitStatus {
+                conn_id: 7,
+                code: 42,
+            },
         ] {
             let bytes = msg.to_bytes().unwrap();
             let decoded = Message::from_bytes(&bytes).unwrap();
             match (msg, decoded) {
                 (
-                    Message::Exec { conn_id: a, cmd: c1, cols: cl1, rows: r1, term: t1 },
-                    Message::Exec { conn_id: b, cmd: c2, cols: cl2, rows: r2, term: t2 },
+                    Message::Exec {
+                        conn_id: a,
+                        cmd: c1,
+                        cols: cl1,
+                        rows: r1,
+                        term: t1,
+                    },
+                    Message::Exec {
+                        conn_id: b,
+                        cmd: c2,
+                        cols: cl2,
+                        rows: r2,
+                        term: t2,
+                    },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(c1, c2);
@@ -173,15 +196,29 @@ mod tests {
                     assert_eq!(t1, t2);
                 }
                 (
-                    Message::Resize { conn_id: a, cols: cl1, rows: r1 },
-                    Message::Resize { conn_id: b, cols: cl2, rows: r2 },
+                    Message::Resize {
+                        conn_id: a,
+                        cols: cl1,
+                        rows: r1,
+                    },
+                    Message::Resize {
+                        conn_id: b,
+                        cols: cl2,
+                        rows: r2,
+                    },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!((cl1, r1), (cl2, r2));
                 }
                 (
-                    Message::ExitStatus { conn_id: a, code: c1 },
-                    Message::ExitStatus { conn_id: b, code: c2 },
+                    Message::ExitStatus {
+                        conn_id: a,
+                        code: c1,
+                    },
+                    Message::ExitStatus {
+                        conn_id: b,
+                        code: c2,
+                    },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(c1, c2);
@@ -194,23 +231,44 @@ mod tests {
     #[test]
     fn test_transfer_messages() {
         for msg in [
-            Message::Pull { conn_id: 9, paths: vec!["/etc/hosts".into(), "/tmp/x".into()], level: 3 },
-            Message::Push { conn_id: 10, path: "/tmp/dest".into() },
+            Message::Pull {
+                conn_id: 9,
+                paths: vec!["/etc/hosts".into(), "/tmp/x".into()],
+                level: 3,
+            },
+            Message::Push {
+                conn_id: 10,
+                path: "/tmp/dest".into(),
+            },
         ] {
             let bytes = msg.to_bytes().unwrap();
             let decoded = Message::from_bytes(&bytes).unwrap();
             match (msg, decoded) {
                 (
-                    Message::Pull { conn_id: a, paths: p1, level: l1 },
-                    Message::Pull { conn_id: b, paths: p2, level: l2 },
+                    Message::Pull {
+                        conn_id: a,
+                        paths: p1,
+                        level: l1,
+                    },
+                    Message::Pull {
+                        conn_id: b,
+                        paths: p2,
+                        level: l2,
+                    },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(p1, p2);
                     assert_eq!(l1, l2);
                 }
                 (
-                    Message::Push { conn_id: a, path: p1 },
-                    Message::Push { conn_id: b, path: p2 },
+                    Message::Push {
+                        conn_id: a,
+                        path: p1,
+                    },
+                    Message::Push {
+                        conn_id: b,
+                        path: p2,
+                    },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(p1, p2);

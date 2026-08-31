@@ -1,8 +1,8 @@
 use anyhow::Result;
+use rama::telemetry::tracing::debug;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::debug;
 
 use crate::protocol::Message;
 use crate::relay::next_conn_id;
@@ -79,7 +79,13 @@ async fn session(
         // Ask the server to open the PTY; the ACK is empty Data on success, or an
         // Error (e.g. exec disabled) which we surface before touching the terminal.
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
-        let exec_msg = Message::Exec { conn_id, cmd, cols, rows, term };
+        let exec_msg = Message::Exec {
+            conn_id,
+            cmd,
+            cols,
+            rows,
+            term,
+        };
         if let Some(Message::Error { message, .. }) = tunnel.send_connect(&exec_msg).await? {
             anyhow::bail!("{}", message);
         }
@@ -98,7 +104,7 @@ async fn session(
         let sender_task = tokio::spawn(async move {
             while let Some(msg) = msg_rx.recv().await {
                 if let Err(e) = sender_tunnel.send_message(&msg).await {
-                    debug!("send_message failed: {}", e);
+                    debug!(error = %e, "send_message failed");
                     break;
                 }
             }
@@ -158,7 +164,7 @@ async fn session(
                             }
                         }
                         Err(e) => {
-                            debug!("stdin read error: {}", e);
+                            debug!(error = %e, "stdin read failed");
                             stdin_open = false;
                         }
                     }

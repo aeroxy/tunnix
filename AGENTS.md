@@ -12,8 +12,8 @@
 
 ## Config & CLI
 
-- The single binary `tunnix` takes a subcommand: `tunnix server` or `tunnix client`.
-- Both subcommands default to reading `config.toml` from the current working directory when no `--config` flag is provided; fall back to `Config::default()` if the file doesn't exist.
+- The single binary `tunnix` takes a subcommand: `server`, `client`, `remote-exec` (Unix), `push`, or `pull`.
+- Without `--config`, every subcommand tries `./config.toml`, then the per-user config, then `Config::default()` when neither file exists. An explicit unreadable or invalid file is an error.
 - CLI flags always override config file values. `TUNNIX_PASSWORD` env var sets the password.
 - Required fields (e.g. password, server URL) are validated after merging config + CLI, so they can be satisfied by either source.
 - `config.toml` is the live file with real credentials — never commit it. `config.example.toml` is the committed template; keep it in sync with any config schema changes.
@@ -25,8 +25,8 @@
 - **Transport**: HTTP/SSE. Client uploads via `POST /[prefix]/send/{session_id}`, downloads via SSE on `GET /[prefix]/stream/{session_id}`.
 - **Path prefix**: The server strips `path_prefix` from incoming paths before routing. Bare `/` and `/health` always match regardless of prefix (load-balancer probes). See `src/server.rs`.
 - **CONNECT ACK**: The server returns the ACK as the HTTP response body of the POST to `/send/{session_id}`. The client must decrypt the response body using `send_connect()`.
-- **Dual-protocol listener**: The client listens on one port for both SOCKS5 and HTTP proxy. Protocol is detected by peeking the first byte (`0x05` = SOCKS5, ASCII letter = HTTP). See `src/proxy.rs`.
-- **Session lifecycle**: SSE reconnect replaces the session on the server (new `sse_tx`/`sse_rx`). In-flight connections from the old session lose their SSE pipe — handle reconnects carefully.
+- **Dual-protocol listener**: The client listens on one port for both SOCKS5 and HTTP proxy. Rama's generic replaying `PeekRouter` recognizes the SOCKS5 version byte and otherwise falls back to the Rama HTTP server; this works around a Rama 0.4 `Socks5PeekRouter` greeting bug. See `src/proxy.rs`.
+- **Session lifecycle**: SSE reconnect replaces the session's `sse_tx` while preserving its connection writers; a fresh server session sends `Reset` so the client drops orphaned connections.
 - **Multiplexing**: Multiple connections share one SSE stream, demuxed by `conn_id` (global `AtomicU32` in `src/relay.rs`).
 
 ## Development

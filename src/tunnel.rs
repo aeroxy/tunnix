@@ -1,14 +1,27 @@
+use crate::crypto::Crypto;
+use crate::protocol::Message;
+use crate::reload::{build_http_client, HotClientConfig};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use base64ct::{Base64, Encoding};
+use rama::{
+    bytes::Bytes,
+    error::BoxError,
+    futures::{FutureExt, StreamExt},
+    http::{
+        body::util::BodyExt,
+        service::client::{HttpClientExt, RequestBuilder},
+        sse::{EventDataLineReader, EventDataRead},
+        BodyExtractExt, HeaderMap, Response,
+    },
+    net::uri::Uri,
+    rt::Executor,
+    telemetry::tracing::{debug, error, info, warn},
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Notify};
-use tracing::{debug, error, info, warn};
-use crate::crypto::Crypto;
-use crate::protocol::Message;
-use crate::reload::{build_http_client, HotClientConfig};
 
 /// Bound on establishing the SSE GET (connect + response headers). The
 /// http_client has no global timeout (it would kill the streaming body), and
@@ -31,6 +44,45 @@ pub enum TunnelEvent {
     Exit(i32),
 }
 
+#[derive(Debug)]
+enum EncryptedSseData {
+    Frame(Vec<u8>),
+    Invalid(String),
+}
+
+#[derive(Debug, Default)]
+struct EncryptedSseDataReader {
+    data: Option<EncryptedSseData>,
+}
+
+impl EventDataRead for EncryptedSseData {
+    type Reader = EncryptedSseDataReader;
+
+    fn line_reader() -> Self::Reader {
+        EncryptedSseDataReader::default()
+    }
+}
+
+impl EventDataLineReader for EncryptedSseDataReader {
+    type Data = EncryptedSseData;
+
+    fn read_line(&mut self, line: &str) -> Result<(), BoxError> {
+        self.data = Some(if self.data.is_some() {
+            EncryptedSseData::Invalid("encrypted SSE event has multiple data lines".to_owned())
+        } else {
+            match Base64::decode_vec(line.trim()) {
+                Ok(data) => EncryptedSseData::Frame(data),
+                Err(error) => EncryptedSseData::Invalid(error.to_string()),
+            }
+        });
+        Ok(())
+    }
+
+    fn data(&mut self, _event: Option<&str>) -> Result<Option<Self::Data>, BoxError> {
+        Ok(self.data.take())
+    }
+}
+
 /// Tunnel handles communication with the server via SSE + HTTP POST
 pub struct Tunnel {
     pub session_id: Arc<tokio::sync::RwLock<String>>,
@@ -43,19 +95,22 @@ pub struct Tunnel {
 impl Tunnel {
     /// Connect to the server: open SSE stream and start reading
     pub async fn connect(
-        server_url: &str,
+        server_url: &Uri,
         crypto: Arc<Crypto>,
-        headers: &HashMap<String, String>,
+        headers: &HeaderMap,
         health_expected: &str,
+        exec: Executor,
     ) -> Result<Arc<Self>> {
         let session_id = format!("{:016x}", rand::random::<u64>());
 
-        let http_client = build_http_client(headers)?;
+        let http_client = build_http_client(exec.clone());
+        let http_headers = headers.clone();
 
-        let server_base_url = server_url.trim_end_matches('/').to_string();
+        let server_base_url = server_url.clone();
         let hot = Arc::new(ArcSwap::from_pointee(HotClientConfig {
             crypto,
             http_client,
+            http_headers,
             server_base_url: server_base_url.clone(),
         }));
 
@@ -68,12 +123,15 @@ impl Tunnel {
         });
 
         // Test connection with health check
-        let health_url = format!("{}/health", server_base_url);
-        info!("Testing connection to {}", health_url);
+        let health_url = endpoint(&server_base_url, ["health"]);
+        info!(url = %health_url, "checking tunnel server health");
         let hot_snap = tunnel.hot.load();
-        let resp = hot_snap.http_client.get(&health_url).send().await?;
-        let body = resp.text().await?;
-        info!("Server health: {}", body.trim());
+        let resp = with_http_headers(hot_snap.http_client.get(health_url), &hot_snap.http_headers)
+            .send()
+            .await
+            .map_err(http_error)?;
+        let body = resp.try_into_string().await.map_err(http_error)?;
+        info!(response = body.trim(), "tunnel server health check passed");
         if body.trim() != health_expected.trim() {
             anyhow::bail!(
                 "Health check mismatch: expected {:?}, got {:?}",
@@ -92,7 +150,7 @@ impl Tunnel {
 
         // Open SSE stream
         let tunnel_clone = tunnel.clone();
-        tokio::spawn(async move {
+        exec.spawn_cancellable_task(async move {
             // First iteration is the initial connect — gate readiness on the
             // first `data:` frame so a fresh-session Reset is consumed before
             // `register_connection` lands. On reconnects, the server won't send
@@ -106,7 +164,7 @@ impl Tunnel {
                 match res {
                     Err(e) if e.to_string().contains("forced reconnect") => continue,
                     Err(e) => {
-                        error!("SSE stream error: {}, reconnecting in 3s...", e);
+                        error!(error = %e, retry_after_seconds = 3, "SSE stream failed");
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     }
                     Ok(()) => {
@@ -120,7 +178,10 @@ impl Tunnel {
         // session when it handles GET /stream, so the first POST /send must not
         // race ahead of it (otherwise: 503 "unknown session").
         if tokio::time::timeout(RECONNECT_WAIT, ready).await.is_err() {
-            warn!("SSE stream not ready after {:?}; proceeding anyway", RECONNECT_WAIT);
+            warn!(
+                timeout_seconds = RECONNECT_WAIT.as_secs(),
+                "SSE stream not ready; proceeding anyway"
+            );
         }
 
         Ok(tunnel)
@@ -130,21 +191,25 @@ impl Tunnel {
     async fn sse_read_loop(&self, is_reconnect: bool) -> Result<()> {
         let hot = self.hot.load();
         let sid = self.session_id.read().await;
-        let url = format!("{}/stream/{}", hot.server_base_url, *sid);
-        info!("Opening SSE stream for session {} at {}", sid, hot.server_base_url);
+        let url = endpoint(&hot.server_base_url, ["stream", sid.as_str()]);
+        info!(session_id = %sid, base_url = %hot.server_base_url, "opening SSE stream");
         let captured_sid = sid.clone();
         drop(sid);
         // `send()` resolves at response headers, so this bounds only the
         // connection setup, not the long-lived streaming body.
-        let resp = tokio::time::timeout(SSE_CONNECT_TIMEOUT, hot.http_client.get(&url).send())
-            .await
-            .map_err(|_| anyhow::anyhow!("SSE connect timed out after {:?}", SSE_CONNECT_TIMEOUT))??;
+        let resp = tokio::time::timeout(
+            SSE_CONNECT_TIMEOUT,
+            with_http_headers(hot.http_client.get(url), &hot.http_headers).send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("SSE connect timed out after {:?}", SSE_CONNECT_TIMEOUT))?
+        .map_err(http_error)?;
 
         if !resp.status().is_success() {
             anyhow::bail!("SSE stream failed: {}", resp.status());
         }
 
-        info!("SSE stream connected");
+        info!(session_id = %captured_sid, "SSE stream connected");
 
         // Drain any reconnect permit buffered while we were connecting
         // (send_message fires notify_one on POST failure; if it fired during
@@ -159,7 +224,6 @@ impl Tunnel {
         // mid-check, since it needs the write lock first.
         let current_sid = self.session_id.read().await;
         if *current_sid == captured_sid {
-            use futures::FutureExt;
             let _ = self.reconnect_signal.notified().now_or_never();
         } else {
             drop(current_sid);
@@ -167,18 +231,16 @@ impl Tunnel {
         }
         drop(current_sid);
 
-        use futures::StreamExt;
-        let mut stream = resp.bytes_stream();
-
-        let mut buffer = String::new();
+        // Rama 0.5-dev #1140 makes the core SSE decoder substantially faster;
+        // this typed reader also avoids materializing each base64 payload as a
+        // temporary String on Rama 0.4.
+        let mut stream = resp.into_body().into_event_stream::<EncryptedSseData>();
         // On the initial connect, signal readiness only AFTER the first
         // `data:` frame is processed: a new session's first data frame is
         // `Reset` (which clears pending channels), and handling it before
         // `connect()` returns ensures the first registration + POST can't be
-        // wiped by a late Reset. We can't just wait for the first chunk: the
-        // server's keepalive `:\n\n` comment can be emitted ahead of the
-        // queued Reset (its interval's first tick is immediate), so only a
-        // real data frame guarantees the Reset is consumed.
+        // wiped by a late Reset. Only a real data frame proves that Reset was
+        // consumed; transport readiness or a comment does not.
         //
         // On reconnects the server won't queue a Reset, so the first event may
         // be a keepalive; signal on any event to avoid stalling send_message
@@ -188,46 +250,34 @@ impl Tunnel {
         loop {
             tokio::select! {
                 chunk = tokio::time::timeout(Duration::from_secs(30), stream.next()) => {
-                    let chunk = match chunk {
-                        Ok(Some(c)) => c?,
+                    let event = match chunk {
+                        Ok(Some(event)) => event.map_err(http_error)?,
                         Ok(None) => break,
                         Err(_) => {
-                            warn!("SSE read timeout, reconnecting");
+                            warn!(timeout_seconds = 30, "SSE read timed out; reconnecting");
                             break;
                         }
                     };
-                    let text = String::from_utf8_lossy(&chunk);
-                    buffer.push_str(&text);
 
-                    while let Some(pos) = buffer.find("\n\n") {
-                        let event = buffer[..pos].to_string();
-                        buffer = buffer[pos + 2..].to_string();
-
-                        let mut had_data = false;
-                        for line in event.lines() {
-                            if let Some(data_str) = line.strip_prefix("data: ") {
-                                match Base64::decode_vec(data_str.trim()) {
-                                    Ok(encrypted) => {
-                                        self.handle_sse_message(&encrypted).await;
-                                        had_data = true;
-                                    }
-                                    Err(e) => {
-                                        warn!("Base64 decode error: {}", e);
-                                    }
+                    if let Some(data) = event.into_data() {
+                        match data {
+                            EncryptedSseData::Frame(encrypted) => {
+                                self.handle_sse_message(&encrypted).await;
+                                if !signaled_ready {
+                                    self.sse_ready.notify_waiters();
+                                    signaled_ready = true;
                                 }
                             }
+                            EncryptedSseData::Invalid(error) => {
+                                warn!(%error, "SSE payload base64 decode failed")
+                            }
                         }
-                        if had_data && !signaled_ready {
-                            self.sse_ready.notify_waiters();
-                            signaled_ready = true;
-                        } else if is_reconnect && !signaled_ready {
-                            // Keepalive comment — the stream is up and the
-                            // server is not going to send a Reset. Notify
-                            // send_message's retry path so it doesn't burn
-                            // the full RECONNECT_WAIT.
-                            self.sse_ready.notify_waiters();
-                            signaled_ready = true;
-                        }
+                    } else if is_reconnect && !signaled_ready {
+                        // Rama exposes keepalive comments as data-less events.
+                        // A reconnect does not carry Reset, so headers plus any
+                        // parsed event are enough to release the retry path.
+                        self.sse_ready.notify_waiters();
+                        signaled_ready = true;
                     }
                 }
                 _ = self.reconnect_signal.notified() => {
@@ -247,7 +297,7 @@ impl Tunnel {
         let plaintext = match hot.crypto.decrypt(encrypted) {
             Ok(p) => p,
             Err(e) => {
-                error!("Decrypt failed: {}", e);
+                error!(error = %e, "SSE payload decryption failed");
                 return;
             }
         };
@@ -255,14 +305,14 @@ impl Tunnel {
         let message = match Message::from_bytes(&plaintext) {
             Ok(m) => m,
             Err(e) => {
-                error!("Deserialize failed: {}", e);
+                error!(error = %e, "SSE payload deserialization failed");
                 return;
             }
         };
 
         match message {
             Message::Data { conn_id, data } => {
-                debug!("[{}] SSE data {} bytes", conn_id, data.len());
+                debug!(conn_id, bytes = data.len(), "received SSE tunnel data");
                 // Clone the sender out of the guard before awaiting send().
                 // Holding the mutex across `tx.send().await` lets one slow
                 // consumer (full channel) stall dispatch for every connection.
@@ -275,7 +325,7 @@ impl Tunnel {
                 }
             }
             Message::Close { conn_id } => {
-                debug!("[{}] SSE close", conn_id);
+                debug!(conn_id, "received SSE tunnel close");
                 let tx = {
                     let channels = self.response_channels.lock().await;
                     channels.get(&conn_id).cloned()
@@ -285,7 +335,7 @@ impl Tunnel {
                 }
             }
             Message::Error { conn_id, message } => {
-                warn!("[{:?}] SSE error: {}", conn_id, message);
+                warn!(?conn_id, error = %message, "received SSE tunnel error");
                 if let Some(cid) = conn_id {
                     let tx = {
                         let channels = self.response_channels.lock().await;
@@ -297,7 +347,7 @@ impl Tunnel {
                 }
             }
             Message::ExitStatus { conn_id, code } => {
-                debug!("[{}] SSE exit status {}", conn_id, code);
+                debug!(conn_id, code, "received SSE process exit status");
                 let tx = {
                     let channels = self.response_channels.lock().await;
                     channels.get(&conn_id).cloned()
@@ -314,9 +364,9 @@ impl Tunnel {
                 let count = channels.len();
                 channels.clear();
                 if count > 0 {
-                    warn!("Server session reset: tearing down {} pending connection(s)", count);
+                    warn!(pending_connections = count, "server session reset");
                 } else {
-                    debug!("Server session reset (no pending connections)");
+                    debug!("server session reset with no pending connections");
                 }
             }
             Message::Pong => debug!("PONG"),
@@ -327,7 +377,7 @@ impl Tunnel {
     pub async fn send_message(&self, msg: &Message) -> Result<Option<Vec<u8>>> {
         let hot = self.hot.load();
         let bytes = msg.to_bytes()?;
-        let encrypted = bytes::Bytes::from(hot.crypto.encrypt(&bytes)?);
+        let encrypted = Bytes::from(hot.crypto.encrypt(&bytes)?);
 
         let sid = self.session_id.read().await.clone();
 
@@ -344,7 +394,7 @@ impl Tunnel {
                 // reconnect instead of racing to rotate (the old "death
                 // spiral"), and preserves in-flight server relays when the
                 // server didn't actually restart.
-                warn!("send failed: {}; forcing SSE reconnect and retrying", first_err);
+                warn!(error = %first_err, "send failed; forcing SSE reconnect and retrying");
                 // Register interest BEFORE signaling, so the SSE task can't
                 // win the race and fire sse_ready between notify_one and our
                 // first poll.
@@ -361,21 +411,29 @@ impl Tunnel {
         }
     }
 
-    async fn try_post(&self, sid: &str, encrypted: bytes::Bytes) -> Result<Option<Vec<u8>>> {
+    async fn try_post(&self, sid: &str, encrypted: Bytes) -> Result<Option<Vec<u8>>> {
         let hot = self.hot.load();
-        let url = format!("{}/send/{}", hot.server_base_url, sid);
-        let resp = hot
-            .http_client
-            .post(&url)
+        let url = endpoint(&hot.server_base_url, ["send", sid]);
+        let resp = with_http_headers(hot.http_client.post(url), &hot.http_headers)
             .body(encrypted)
             .send()
-            .await?;
+            .await
+            .map_err(http_error)?;
 
         let status = resp.status();
-        let body = resp.bytes().await?;
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(http_error)?
+            .to_bytes();
 
         if !status.is_success() {
-            anyhow::bail!("Server error: {} {}", status, String::from_utf8_lossy(&body));
+            anyhow::bail!(
+                "Server error: {} {}",
+                status,
+                String::from_utf8_lossy(&body)
+            );
         }
 
         if body.is_empty() {
@@ -413,6 +471,31 @@ impl Tunnel {
     }
 }
 
+fn endpoint<const N: usize>(base: &Uri, segments: [&str; N]) -> Uri {
+    let mut uri = base.clone();
+    {
+        let mut path = uri.path_mut();
+        for segment in segments {
+            path.push_segment(segment);
+        }
+    }
+    uri
+}
+
+fn with_http_headers<'a, S, B, M>(
+    mut request: RequestBuilder<'a, S, Response<B>, M>,
+    headers: &HeaderMap,
+) -> RequestBuilder<'a, S, Response<B>, M> {
+    for (name, value) in headers.ordered_iter() {
+        request = request.header(name.clone(), value.clone());
+    }
+    request
+}
+
+fn http_error(error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,8 +506,9 @@ mod tests {
     fn test_tunnel(password: &str) -> Tunnel {
         let hot = HotClientConfig {
             crypto: Arc::new(Crypto::new(password).unwrap()),
-            http_client: reqwest::Client::new(),
-            server_base_url: "http://127.0.0.1:0".to_string(),
+            http_client: build_http_client(Executor::default()),
+            http_headers: Default::default(),
+            server_base_url: Uri::parse("http://127.0.0.1:0").unwrap(),
         };
         Tunnel {
             session_id: Arc::new(tokio::sync::RwLock::new("test-session".to_string())),
@@ -441,12 +525,53 @@ mod tests {
         tunnel.hot.load().crypto.encrypt(&bytes).unwrap()
     }
 
+    #[test]
+    fn endpoint_appends_and_encodes_typed_path_segments() {
+        let base = Uri::parse("https://example.com/tunnix/").unwrap();
+        let endpoint = endpoint(&base, ["stream", "id/with space"]);
+        assert_eq!(
+            endpoint.to_string(),
+            "https://example.com/tunnix/stream/id%2Fwith%20space"
+        );
+    }
+
+    #[test]
+    fn encrypted_sse_data_decodes_directly_into_bytes() {
+        let encrypted = b"binary tunnel frame";
+        let encoded = Base64::encode_string(encrypted);
+        let mut reader = EncryptedSseData::line_reader();
+        reader.read_line(&encoded).unwrap();
+
+        match reader.data(None).unwrap().unwrap() {
+            EncryptedSseData::Frame(frame) => assert_eq!(frame, encrypted),
+            EncryptedSseData::Invalid(error) => panic!("unexpected decode failure: {error}"),
+        }
+    }
+
+    #[test]
+    fn encrypted_sse_data_rejects_multiple_data_lines() {
+        let mut reader = EncryptedSseData::line_reader();
+        reader.read_line("YQ==").unwrap();
+        reader.read_line("Yg==").unwrap();
+
+        assert!(matches!(
+            reader.data(None).unwrap(),
+            Some(EncryptedSseData::Invalid(_))
+        ));
+    }
+
     #[tokio::test]
     async fn data_is_dispatched_to_the_registered_conn() {
         let tunnel = test_tunnel("pw");
         let mut rx = tunnel.register_connection(1).await;
 
-        let frame = sse_frame(&tunnel, &Message::Data { conn_id: 1, data: b"hello".to_vec() });
+        let frame = sse_frame(
+            &tunnel,
+            &Message::Data {
+                conn_id: 1,
+                data: b"hello".to_vec(),
+            },
+        );
         tunnel.handle_sse_message(&frame).await;
 
         match rx.try_recv() {
@@ -471,7 +596,13 @@ mod tests {
         let tunnel = test_tunnel("pw");
         let mut rx = tunnel.register_connection(3).await;
 
-        let frame = sse_frame(&tunnel, &Message::ExitStatus { conn_id: 3, code: 42 });
+        let frame = sse_frame(
+            &tunnel,
+            &Message::ExitStatus {
+                conn_id: 3,
+                code: 42,
+            },
+        );
         tunnel.handle_sse_message(&frame).await;
 
         assert!(matches!(rx.try_recv(), Ok(TunnelEvent::Exit(42))));
@@ -499,7 +630,13 @@ mod tests {
     async fn data_for_an_unknown_conn_is_a_silent_no_op() {
         let tunnel = test_tunnel("pw");
         // No registration for conn 99: must not panic and must not register one.
-        let frame = sse_frame(&tunnel, &Message::Data { conn_id: 99, data: vec![1, 2, 3] });
+        let frame = sse_frame(
+            &tunnel,
+            &Message::Data {
+                conn_id: 99,
+                data: vec![1, 2, 3],
+            },
+        );
         tunnel.handle_sse_message(&frame).await;
         assert!(tunnel.response_channels.lock().await.is_empty());
     }
@@ -511,7 +648,12 @@ mod tests {
 
         // Frame encrypted under a different key fails to decrypt and is ignored.
         let wrong = Crypto::new("wrong-pw").unwrap();
-        let bytes = Message::Data { conn_id: 1, data: b"x".to_vec() }.to_bytes().unwrap();
+        let bytes = Message::Data {
+            conn_id: 1,
+            data: b"x".to_vec(),
+        }
+        .to_bytes()
+        .unwrap();
         let frame = wrong.encrypt(&bytes).unwrap();
         tunnel.handle_sse_message(&frame).await;
 

@@ -107,8 +107,7 @@ pub(crate) fn spawn_compress(
     let (tx, rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAP);
     let handle = tokio::task::spawn_blocking(move || -> Result<()> {
         let writer = ChannelWriter { tx };
-        let encoder = zstd::stream::Encoder::new(writer, level)
-            .context("init zstd encoder")?;
+        let encoder = zstd::stream::Encoder::new(writer, level).context("init zstd encoder")?;
         let mut builder = tar::Builder::new(encoder);
         builder.follow_symlinks(false);
 
@@ -148,7 +147,11 @@ pub(crate) fn spawn_decompress(dest: PathBuf) -> (mpsc::Sender<Vec<u8>>, JoinHan
     let handle = tokio::task::spawn_blocking(move || -> Result<()> {
         std::fs::create_dir_all(&dest)
             .with_context(|| format!("create destination {}", dest.display()))?;
-        let reader = ChannelReader { rx, leftover: Vec::new(), pos: 0 };
+        let reader = ChannelReader {
+            rx,
+            leftover: Vec::new(),
+            pos: 0,
+        };
         let decoder = zstd::stream::Decoder::new(reader).context("init zstd decoder")?;
         let mut archive = tar::Archive::new(decoder);
         // tar's unpack guards against path traversal: entries with `..` or
@@ -204,7 +207,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(root.join("run.sh")).unwrap().permissions().mode();
+            let mode = std::fs::metadata(root.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o755);
         }
 

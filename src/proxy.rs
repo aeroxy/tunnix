@@ -1,35 +1,103 @@
-use crate::{http_proxy, socks5};
-use crate::tunnel::Tunnel;
-use anyhow::{bail, Result};
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tracing::{debug, info};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
-pub async fn run_proxy(listen_addr: &str, tunnel: Arc<Tunnel>) -> Result<()> {
-    let listener = TcpListener::bind(listen_addr).await?;
-    info!("Proxy listening on {} (SOCKS5 + HTTP)", listen_addr);
+use anyhow::Result;
+use rama::{
+    graceful::Shutdown,
+    http::{
+        client::EasyHttpWebClient,
+        layer::{
+            remove_header::{RemoveRequestHeaderLayer, RemoveResponseHeaderLayer},
+            trace::TraceLayer,
+            upgrade::{EagerHttpProxyConnector, UpgradeLayer},
+        },
+        matcher::MethodMatcher,
+        server::HttpServer,
+        service::web::response::IntoResponse,
+        Request, StatusCode,
+    },
+    io::peek::PeekRouter,
+    layer::ConsumeErrLayer,
+    net::{address::SocketAddress, proxy::IoForwardService},
+    proxy::socks5::{server::Connector as Socks5Connector, Socks5Acceptor},
+    rt::Executor,
+    service::service_fn,
+    tcp::server::TcpListener,
+    telemetry::tracing::{debug, info},
+    tls::client::TlsClientConfig,
+    Layer, Service,
+};
 
-    loop {
-        let (stream, addr) = listener.accept().await?;
-        debug!("Client connected from {}", addr);
-        let tunnel = tunnel.clone();
-        tokio::spawn(async move {
-            if let Err(e) = dispatch(stream, tunnel).await {
-                debug!("Client error from {}: {}", addr, e);
+use crate::{tunnel::Tunnel, tunnel_connector::TunnelConnector};
+
+pub async fn run_proxy(
+    listen_addr: SocketAddress,
+    tunnel: Arc<Tunnel>,
+    exec: Executor,
+    shutdown: Shutdown,
+) -> Result<()> {
+    let listener = TcpListener::bind_address(listen_addr, exec.clone())
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let connector = TunnelConnector::new(tunnel, exec.clone());
+
+    let web_client = EasyHttpWebClient::connector_builder()
+        .with_custom_transport_connector(connector.clone())
+        .with_dns_connector(())
+        .without_tls_proxy_support()
+        .without_proxy_support()
+        .with_tls_support_using_rustls(TlsClientConfig::default_http())
+        .with_default_http_connector(exec.clone())
+        .without_connection_pool()
+        .build_client()
+        .boxed();
+
+    let plain_http = service_fn(move |request: Request| {
+        let web_client = web_client.clone();
+        async move {
+            match web_client.serve(request).await {
+                Ok(response) => Ok::<_, Infallible>(response),
+                Err(error) => {
+                    debug!(?error, "HTTP proxy request failed");
+                    Ok(StatusCode::BAD_GATEWAY.into_response())
+                }
             }
-        });
-    }
-}
+        }
+    });
 
-async fn dispatch(stream: tokio::net::TcpStream, tunnel: Arc<Tunnel>) -> Result<()> {
-    let mut peek = [0u8; 1];
-    stream.peek(&mut peek).await?;
+    let connect =
+        EagerHttpProxyConnector::new(connector.clone(), IoForwardService::new(exec.clone()));
+    let http = HttpServer::auto(exec.clone()).service(
+        (
+            TraceLayer::new_for_http(),
+            ConsumeErrLayer::default(),
+            UpgradeLayer::new(exec.clone(), MethodMatcher::CONNECT, connect),
+            RemoveResponseHeaderLayer::hop_by_hop(),
+            RemoveRequestHeaderLayer::hop_by_hop(),
+        )
+            .into_layer(plain_http),
+    );
 
-    match peek[0] {
-        // SOCKS5 handshake always starts with version byte 0x05
-        0x05 => socks5::handle_socks5_client(stream, tunnel).await,
-        // HTTP methods all start with ASCII uppercase letters
-        b'A'..=b'Z' | b'a'..=b'z' => http_proxy::handle_http_proxy_client(stream, tunnel).await,
-        b => bail!("Unknown protocol (first byte: 0x{:02x})", b),
-    }
+    let socks = Socks5Acceptor::new(exec.clone()).with_connector(
+        Socks5Connector::new(connector, IoForwardService::new(exec.clone()))
+            .with_hide_local_address(true),
+    );
+    // Socks5PeekRouter in Rama 0.4 interprets the greeting's NMETHODS count as
+    // a method ID and rejects valid counts such as four. Match the protocol
+    // version with Rama's generic replaying router until the dependency
+    // includes the upstream fix.
+    let proxy = PeekRouter::from_prefix(b"\x05", socks).with_fallback(http);
+
+    info!(
+        %listen_addr,
+        protocols = "socks5,http",
+        "proxy listening"
+    );
+    shutdown.spawn_task(listener.serve(proxy));
+    drop(exec);
+    let elapsed = shutdown
+        .shutdown_with_limit(Duration::from_secs(30))
+        .await
+        .map_err(|error| anyhow::anyhow!("graceful proxy shutdown timed out: {error}"))?;
+    info!(?elapsed, "proxy shutdown complete");
+    Ok(())
 }

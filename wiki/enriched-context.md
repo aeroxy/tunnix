@@ -6,7 +6,25 @@ Design decisions, constraints, and non-obvious facts about tunnix.
 
 ## Why HTTP/SSE instead of WebSocket
 
-Cloud Shell Web Preview proxies HTTP traffic but strips or mangles WebSocket upgrade headers in some configurations. HTTP/SSE avoids that: the downstream (server→client) is a plain `text/event-stream` GET, and the upstream (client→server) is a series of POST requests. Both are standard HTTP/1.1, which Cloud Shell passes through reliably.
+Cloud Shell Web Preview proxies HTTP traffic but strips or mangles WebSocket upgrade headers in some configurations. HTTP/SSE avoids that: the downstream (server→client) is a plain `text/event-stream` GET, and the upstream (client→server) is a series of POST requests. Cloud Shell can pass these ordinary HTTP exchanges without WebSocket support; the Rama client can negotiate HTTP/1.1 or HTTP/2 with an HTTPS reverse proxy.
+
+HTTP/2 is a deliberate capability expansion in this migration. The old server explicitly used Hyper's HTTP/1 builder, while reqwest was built with default features disabled and without its `http2` feature. Rama's `default_http` TLS profile and auto server support both HTTP/1.1 and HTTP/2; SSE's forbidden connection-specific headers are filtered on HTTP/2.
+
+The control-plane URL intentionally accepts both `http://` and `https://`: direct and loopback deployments can reach tunnix's plaintext server, while public deployments normally use HTTPS at Cloud Shell or a reverse proxy that terminates TLS. This is independent of the proxied target protocol—the local SOCKS5/HTTP listener can carry arbitrary TCP, including end-to-end target TLS, inside the encrypted tunnix envelope.
+
+The control client retains reqwest's ten-redirect limit and removes credentials on cross-origin hops. Rama 0.4 cannot automatically replay its erased non-empty request body across a `307`/`308`, so a redirect of `/send/{session_id}` is returned as an error; configure `server_url` with the final endpoint. Empty-body health and SSE redirects remain supported.
+
+Rama 0.4's HTTP `Router` matches paths after one percent-decoding pass and compares ASCII letters case-insensitively. Consequently spellings such as `/SEND/...` or equivalent percent-encoded paths can reach a tunnix endpoint even though the legacy manual router required the exact raw path. A typed strict-path policy exists on the local Rama 0.5 patch branch, but not in the released dependency; opt this protocol router into that policy when tunnix adopts a Rama revision that contains it.
+
+The router now returns HTTP-semantic errors for unmatched requests: `404 Not Found` for an unknown path and `405 Method Not Allowed` with `Allow` for a known path using the wrong method. The legacy catch-all returned `200 OK` with a `not found` body in both cases; this status correction is intentional.
+
+Plain HTTP proxy requests are temporarily unpooled on Rama 0.4 because the pooled custom-transport stack overflowed Tokio's default debug worker stack. [Upstream change #1141](https://github.com/plabayo/rama/pull/1141) fixes separate pool reuse and waiter correctness problems in Rama 0.5 development; it does not establish that the stack overflow is fixed. Reproduce that failure on 0.5 before restoring and load-testing pooling.
+
+The client uses a typed SSE data reader that decodes encrypted base64 frames directly into bytes. [Upstream change #1140](https://github.com/plabayo/rama/pull/1140) optimizes Rama's core SSE decoder in 0.5 development, but application-specific typed decoding still avoids a temporary `String`.
+
+TCP relays preserve half-close semantics in both directions. Local input EOF shuts down only target input and keeps delivering the target response. Target output EOF sends a clean FIN to the local application while keeping client input registered and forwarding until the application sends its own directional `Close`. Only an actual forwarding failure switches to discarded-input cleanup, bounded to five seconds so a broken relay cannot linger indefinitely or immediately turn an already-delivered FIN into RST.
+
+SSE reconnection preserves live target writers, but the current tunnel protocol has no sequence numbers or delivery acknowledgements. A frame accepted into an old server-side SSE queue can therefore be lost if that response is replaced before the frame reaches the client; retrying a later terminal message on the new queue cannot prove continuity. Lossless connection preservation across SSE epochs requires a protocol follow-up with sequencing, acknowledgement, replay, and client-side deduplication. Until then, reconnect preservation is best-effort rather than a wire-fidelity guarantee.
 
 The README previously said "WebSocket tunnel" — that was aspirational documentation from an earlier design. The transport has always been HTTP/SSE in the actual implementation.
 
@@ -16,7 +34,7 @@ The README previously said "WebSocket tunnel" — that was aspirational document
 
 Many tools (system proxy settings, ClashX, curl via `http_proxy` env var) default to HTTP proxy. Others (older tools, some CLI utilities) prefer SOCKS5. Running both on one port means a single `local_addr` in config works for everything.
 
-Protocol detection is zero-cost: a single `peek` of one byte. SOCKS5 always starts with `0x05`; HTTP always starts with an ASCII letter. There is no overlap.
+Rama's generic `PeekRouter` checks and replays the SOCKS5 version byte before falling back to the HTTP server; `Socks5Acceptor` then validates the complete greeting. This avoids a Rama 0.4 `Socks5PeekRouter` bug that interprets the `NMETHODS` count as a method ID. Neither protocol parser loses the peeked byte.
 
 ---
 
@@ -28,11 +46,11 @@ This is intentional: it gives the client a synchronous acknowledgment without ne
 
 ---
 
-## SSE reconnect loses in-flight connections
+## SSE reconnect preserves the server-side session
 
-The SSE loop in `tunnel.rs` reconnects automatically on error. A new SSE connection creates a fresh session on the server (`sse_tx`/`sse_rx` pair). Any `conn_id`s registered against the old session lose their SSE pipe — `TunnelEvent` receivers will never see data again and will stall.
+The SSE loop in `tunnel.rs` reconnects automatically on error. Reconnecting with the same session ID replaces only the session's `sse_tx`; existing TCP relay tasks look up that sender for every message and continue on the new stream.
 
-In practice this is acceptable because any active TCP connections through the proxy will also break when the SSE drops. The user's application reconnects, which creates new `conn_id`s registered against the new session.
+If the server has restarted and no longer knows the session, the new stream sends `Reset`. The client then clears its response channels so orphaned local relays close instead of stalling.
 
 ---
 
@@ -54,7 +72,9 @@ The target server expects origin-form:
 GET /path HTTP/1.1
 ```
 
-`http_proxy.rs` rewrites the first line before forwarding. Headers are passed through verbatim. This is standard HTTP/1.1 proxy behavior (RFC 7230 §5.3.2).
+Rama parses the absolute-form target and adapts it to the origin connection. It also applies the negotiated HTTP version and removes hop-by-hop headers, avoiding the casing, ordering, IPv6-authority, and framing errors possible with the old hand-written parser.
+
+For the uncommon non-`CONNECT` absolute `https://` form, Rama now establishes TLS to the target before sending HTTP. The legacy parser selected port 443 but wrote the request there as plaintext, so that path could not work correctly. Normal HTTPS proxying through `CONNECT` remains an opaque TCP tunnel whose TLS belongs to the local application.
 
 ---
 
@@ -66,7 +86,7 @@ GET /path HTTP/1.1
 
 ## Buffer sizes
 
-The relay uses 32 KB read buffers (`relay.rs`). The SSE event channel per connection has a buffer of 256 messages (`tunnel.rs: mpsc::channel(256)`). These are not configurable at runtime; change them in code if throughput is a bottleneck.
+The relay uses 32 KiB read buffers (`relay.rs`). The SSE event channel per connection has a buffer of 256 messages (`tunnel.rs: mpsc::channel(256)`). These are not configurable at runtime; change them in code if throughput is a bottleneck.
 
 ---
 
@@ -85,5 +105,5 @@ If a non-PTY / non-canonical mode is needed, that's a separate feature (`--no-pt
 
 These are deliberate, operator-driven decisions. Do not "fix" them in a security-pass without coordination.
 
-*   **`danger_accept_invalid_certs(true)` in `reload.rs::build_http_client`** — intentional. Deployments behind a corporate TLS-inspecting proxy (re-signed certs from a MITM CA) need this to complete the handshake.
+*   **`ServerVerifyMode::Disable` in `reload.rs::build_http_client`** — retained from the former reqwest client's `danger_accept_invalid_certs(true)` for compatibility with TLS-inspecting deployments. This is not a desirable permanent default: the follow-up is an explicit verification policy with normal system roots, custom CA roots, and an opt-in insecure mode.
 *   **`tunnix server --allow-exec`** — opt-in only, default `false`, and the server prints a loud warning at startup when it's on. Anyone holding the server password can run a shell on the box. This feature is designed to give remote user GOD MODE to the server.

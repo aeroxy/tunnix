@@ -63,9 +63,11 @@ local_addr = "127.0.0.1:7890"
 
 # Custom headers for the HTTP/SSE connection
 # Get cookie values from browser DevTools → Network tab → any request to the cloudshell.dev domain
-[client.headers]
-Cookie = "CloudShellAuthorization"
-User-Agent = "Chrome"
+# This ordered list preserves repeated field lines and their original casing.
+headers = [
+  ["Cookie", "CloudShellAuthorization"],
+  ["User-Agent", "Chrome"],
+]
 
 [logging]
 # Log level: trace, debug, info, warn, error
