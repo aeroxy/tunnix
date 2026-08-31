@@ -32,7 +32,7 @@ Target service (e.g. api.example.com:443)
 
 ### `proxy.rs` — Rama proxy stack
 
-`run_proxy(listen_addr, tunnel)` binds a Rama TCP listener at a typed `SocketAddress`. `Socks5PeekRouter` validates a SOCKS5 greeting and replays the peeked bytes to `Socks5Acceptor`; all other traffic falls back to Rama's auto HTTP server.
+`run_proxy(listen_addr, tunnel)` binds a Rama TCP listener at a typed `SocketAddress`. A generic replaying `PeekRouter` recognizes the SOCKS5 version byte and delegates full greeting validation to `Socks5Acceptor`; all other traffic falls back to Rama's auto HTTP server. The generic router is a Rama 0.4 workaround for `Socks5PeekRouter` interpreting the greeting's `NMETHODS` count as a method ID.
 
 The SOCKS5 acceptor supports unauthenticated CONNECT for IPv4, IPv6, and domain targets. The HTTP service supports both CONNECT upgrades and plain proxy requests. Rama owns HTTP parsing, request-target adaptation, version negotiation, and hop-by-hop header removal, preserving protocol semantics that the former hand-written parser could not represent reliably.
 
@@ -55,11 +55,9 @@ This boundary deliberately keeps the custom encrypted multiplexing protocol inde
 Each connection gets a unique `conn_id` used to demultiplex messages on the single SSE stream.
 
 `relay(stream, conn_id, tunnel, event_rx)`:
-- **Read task**: reads from TCP in 32 KB chunks → wraps in `Message::Data` → `tunnel.send_message()`.  
-  On EOF, sends `Message::Close` and calls `tunnel.unregister_connection()`.
-- **Write task**: receives `TunnelEvent` from `event_rx` → writes `Data` bytes to TCP.  
-  Stops on `Close` or `Error`.
-- `tokio::select!` on both tasks — whichever finishes first cancels the other.
+- **Read direction**: reads local TCP in 32 KiB chunks → wraps them in `Message::Data` → `tunnel.send_message()`. Local EOF sends a directional `Message::Close` while the response direction keeps draining.
+- **Write direction**: receives `TunnelEvent` from `event_rx` → writes `Data` bytes to local TCP. A clean remote `Close` shuts down only the local write half and keeps forwarding local input; an `Error` terminates the relay.
+- Failed forwarding uses a bounded input linger to avoid turning an already-delivered FIN into an immediate RST; terminal `Close` delivery is bounded as well, and Rama's graceful executor cancels the relay during client shutdown.
 
 ### `tunnel.rs` — HTTP/SSE tunnel
 
@@ -91,6 +89,8 @@ Establishing the SSE `GET` is bounded by a 15s timeout (`SSE_CONNECT_TIMEOUT`): 
 
 `path_prefix` is deserialized as a Rama URI path from `[server] path_prefix = "/my-path"` and stripped with `Uri::path_mut()` before routing. Bare `/` and `/health` always match regardless of prefix, so load-balancer probes work without knowing the prefix.
 
+Rama 0.4's router performs case-insensitive, once-percent-decoded path matching, which is broader than the legacy raw-path matcher. This temporary dependency constraint and its strict-policy follow-up are recorded in [Enriched Context](enriched-context.md).
+
 **Session lifecycle** — `handle_stream` uses `entry().or_insert_with()` to create-or-reuse a `Session` keyed by `session_id`, then always overwrites `sse_tx` with the fresh channel. This preserves `tcp_writers` (active TCP relay tasks) across SSE reconnections. Each `relay_tcp_connection` read task fetches `sse_tx` from the session on every send rather than capturing it at spawn time, so existing relays automatically start writing to the new SSE channel after a client reconnect.
 
 The server decrypts every incoming body and encrypts every outgoing SSE event using the shared `Crypto` instance (ChaCha20-Poly1305, Argon2id key derivation).
@@ -105,7 +105,7 @@ Both daemon listeners use Rama's graceful executor. A shutdown signal stops new 
 
 `src/crypto.rs` — `Crypto` struct:
 - Key derivation: Argon2id from the shared password + a fixed salt.
-- Encryption: ChaCha20-Poly1305 with a random 12-byte nonce prepended to each ciphertext.
+- Encryption: ChaCha20-Poly1305 with a 12-byte nonce (an 8-byte monotonic counter plus 4 random bytes) prepended to each ciphertext.
 - Each `Message` is serialized with `Message::to_bytes()`, encrypted, then sent on the wire.
 
 ---
@@ -118,7 +118,7 @@ Both daemon listeners use Rama's graceful executor. A shutdown signal stops new 
 |---------|-----------|---------|
 | `Connect { conn_id, host, port }` | client → server | Open connection to target |
 | `Data { conn_id, data }` | both | Raw payload bytes |
-| `Close { conn_id }` | both | Connection closed |
+| `Close { conn_id }` | both | Directional byte-stream EOF for TCP relays; terminal close for exec/transfer sessions |
 | `Error { conn_id, message }` | both | Error notification |
 | `Ping` / `Pong` | both | Keep-alive |
 | `Exec { conn_id, cmd, cols, rows, term }` | client → server | Open a PTY for `conn_id` and run `cmd` (`None` = interactive `$SHELL`/`/bin/sh`); `cols`/`rows`/`term` seed the PTY size and type. Requires `allow_exec` on the server (Unix only). |

@@ -12,6 +12,12 @@ HTTP/2 is a deliberate capability expansion in this migration. The old server ex
 
 The control-plane URL intentionally accepts both `http://` and `https://`: direct and loopback deployments can reach tunnix's plaintext server, while public deployments normally use HTTPS at Cloud Shell or a reverse proxy that terminates TLS. This is independent of the proxied target protocol—the local SOCKS5/HTTP listener can carry arbitrary TCP, including end-to-end target TLS, inside the encrypted tunnix envelope.
 
+The control client retains reqwest's ten-redirect limit and removes credentials on cross-origin hops. Rama 0.4 cannot automatically replay its erased non-empty request body across a `307`/`308`, so a redirect of `/send/{session_id}` is returned as an error; configure `server_url` with the final endpoint. Empty-body health and SSE redirects remain supported.
+
+Rama 0.4's HTTP `Router` matches paths after one percent-decoding pass and compares ASCII letters case-insensitively. Consequently spellings such as `/SEND/...` or equivalent percent-encoded paths can reach a tunnix endpoint even though the legacy manual router required the exact raw path. A typed strict-path policy exists on the local Rama 0.5 patch branch, but not in the released dependency; opt this protocol router into that policy when tunnix adopts a Rama revision that contains it.
+
+The router now returns HTTP-semantic errors for unmatched requests: `404 Not Found` for an unknown path and `405 Method Not Allowed` with `Allow` for a known path using the wrong method. The legacy catch-all returned `200 OK` with a `not found` body in both cases; this status correction is intentional.
+
 Plain HTTP proxy requests are temporarily unpooled on Rama 0.4 because the pooled custom-transport stack overflowed Tokio's default debug worker stack. [Upstream change #1141](https://github.com/plabayo/rama/pull/1141) fixes separate pool reuse and waiter correctness problems in Rama 0.5 development; it does not establish that the stack overflow is fixed. Reproduce that failure on 0.5 before restoring and load-testing pooling.
 
 The client uses a typed SSE data reader that decodes encrypted base64 frames directly into bytes. [Upstream change #1140](https://github.com/plabayo/rama/pull/1140) optimizes Rama's core SSE decoder in 0.5 development, but application-specific typed decoding still avoids a temporary `String`.
@@ -28,7 +34,7 @@ The README previously said "WebSocket tunnel" — that was aspirational document
 
 Many tools (system proxy settings, ClashX, curl via `http_proxy` env var) default to HTTP proxy. Others (older tools, some CLI utilities) prefer SOCKS5. Running both on one port means a single `local_addr` in config works for everything.
 
-Rama's `Socks5PeekRouter` peeks and validates the SOCKS5 greeting before falling back to the HTTP server. The peeked bytes are replayed to the selected service, so neither protocol parser loses input.
+Rama's generic `PeekRouter` checks and replays the SOCKS5 version byte before falling back to the HTTP server; `Socks5Acceptor` then validates the complete greeting. This avoids a Rama 0.4 `Socks5PeekRouter` bug that interprets the `NMETHODS` count as a method ID. Neither protocol parser loses the peeked byte.
 
 ---
 
@@ -68,6 +74,8 @@ GET /path HTTP/1.1
 
 Rama parses the absolute-form target and adapts it to the origin connection. It also applies the negotiated HTTP version and removes hop-by-hop headers, avoiding the casing, ordering, IPv6-authority, and framing errors possible with the old hand-written parser.
 
+For the uncommon non-`CONNECT` absolute `https://` form, Rama now establishes TLS to the target before sending HTTP. The legacy parser selected port 443 but wrote the request there as plaintext, so that path could not work correctly. Normal HTTPS proxying through `CONNECT` remains an opaque TCP tunnel whose TLS belongs to the local application.
+
 ---
 
 ## Credentials in config.toml
@@ -78,7 +86,7 @@ Rama parses the absolute-form target and adapts it to the origin connection. It 
 
 ## Buffer sizes
 
-The relay uses 32 KB read buffers (`relay.rs`). The SSE event channel per connection has a buffer of 256 messages (`tunnel.rs: mpsc::channel(256)`). These are not configurable at runtime; change them in code if throughput is a bottleneck.
+The relay uses 32 KiB read buffers (`relay.rs`). The SSE event channel per connection has a buffer of 256 messages (`tunnel.rs: mpsc::channel(256)`). These are not configurable at runtime; change them in code if throughput is a bottleneck.
 
 ---
 

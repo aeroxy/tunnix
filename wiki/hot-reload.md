@@ -6,14 +6,14 @@ Runtime config reload without process restart.
 
 ## How it works
 
-A background task polls `config.toml` mtime every 3 seconds. On change, it waits 200ms (debounce for editors that truncate-then-write), re-parses the file, and swaps the affected fields atomically via `ArcSwap`. If the parse fails, it retries once after 500ms, then skips that cycle — the process continues with the last good config.
+A background task polls the selected config file's mtime every 3 seconds. On change, it waits 200ms (debounce for editors that truncate-then-write), re-parses the file, and swaps the affected fields atomically via `ArcSwap`. If the parse fails, it retries once after 500ms, then skips that cycle — the process continues with the last good config.
 
 The hot config is split into two structs behind `ArcSwap`:
 
-- **Server**: `HotServerConfig` — `crypto`, `path_prefix`, `root_redirect`, `root_html`, `health_body`
+- **Server**: `HotServerConfig` — `crypto`, `path_prefix`, `root_redirect`, `root_html`, `health_body`, `allow_exec`, `allow_transfer`
 - **Client**: `HotClientConfig` — `crypto`, Rama HTTP client, headers, typed server URI
 
-Handlers load a snapshot (`ArcSwap::load()`) at the top of each request. A config swap mid-request is invisible — the request finishes with the snapshot it started with.
+Every `ArcSwap::load()` returns one internally consistent snapshot. Most request phases retain that snapshot, while a later phase may deliberately load again and observe a just-reloaded config; no phase can observe a partially updated `HotServerConfig` or `HotClientConfig`.
 
 ---
 
@@ -28,6 +28,8 @@ Handlers load a snapshot (`ArcSwap::load()`) at the top of each request. A confi
 | `root_redirect` | Yes | — | |
 | `root_html` | Yes | — | |
 | `health_response` | Yes | — | |
+| `allow_exec` | Yes | — | A CLI `--allow-exec` remains authoritative |
+| `allow_transfer` | Yes | — | A CLI `--allow-transfer` remains authoritative |
 
 ## What requires a restart
 

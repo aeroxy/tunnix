@@ -39,10 +39,13 @@ impl Crypto {
     pub fn new(password: &str) -> Result<Self, CryptoError> {
         let key = Self::derive_key(password)?;
         let cipher = ChaCha20Poly1305::new(&key.into());
+        let initial_nonce_counter = OsRng.next_u64();
 
         Ok(Self {
             cipher,
-            nonce_counter: AtomicU64::new(0),
+            // A random starting point keeps equal counter positions across
+            // process restarts and hot-reloaded Crypto instances distinct.
+            nonce_counter: AtomicU64::new(initial_nonce_counter),
         })
     }
 

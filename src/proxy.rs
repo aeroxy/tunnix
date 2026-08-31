@@ -81,10 +81,10 @@ pub async fn run_proxy(
         Socks5Connector::new(connector, IoForwardService::new(exec.clone()))
             .with_hide_local_address(true),
     );
-    // Socks5PeekRouter in Rama 0.4 (and current 0.5-dev) interprets the
-    // greeting's NMETHODS count as a method ID and rejects valid counts such
-    // as four. Match the protocol version with Rama's generic replaying router
-    // until the specialized router validates NMETHODS as a count.
+    // Socks5PeekRouter in Rama 0.4 interprets the greeting's NMETHODS count as
+    // a method ID and rejects valid counts such as four. Match the protocol
+    // version with Rama's generic replaying router until the dependency
+    // includes the upstream fix.
     let proxy = PeekRouter::from_prefix(b"\x05", socks).with_fallback(http);
 
     info!(

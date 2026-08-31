@@ -7,7 +7,11 @@ use rama::{
     error::extra::OpaqueError,
     http::{
         client::{EasyHttpWebClient, HttpPooledConnectorConfig},
-        HeaderMap, Request, Response,
+        layer::follow_redirect::{
+            policy::{FilterCredentials, Limited, PolicyExt},
+            FollowRedirectLayer,
+        },
+        Body, HeaderMap, Request, Response,
     },
     layer::MapErrLayer,
     net::client::{NoProxyEnvLayer, ProxyEnvLayer, ProxyRoutesLayer},
@@ -61,7 +65,7 @@ pub fn build_http_client(exec: Executor) -> HttpClient {
     let client = EasyHttpWebClient::connector_builder()
         .with_default_transport_connector()
         .with_default_dns_connector()
-        .with_tls_proxy_support_using_rustls()
+        .with_tls_proxy_support_using_rustls_config(tls.clone())
         .with_proxy_support()
         .with_tls_support_using_rustls(tls)
         .with_default_http_connector(exec)
@@ -73,7 +77,12 @@ pub fn build_http_client(exec: Executor) -> HttpClient {
         .expect("static HTTP pool configuration is valid")
         .build_client();
 
+    let redirect_policy =
+        Limited::new(10).and::<FilterCredentials, Body, OpaqueError>(FilterCredentials::default());
     let client = (
+        // reqwest followed up to ten redirects and stripped credentials on
+        // cross-origin hops; retain that behavior for control-plane requests.
+        FollowRedirectLayer::with_policy(redirect_policy),
         // NOTE: If desired we can also add here rama's
         // support for System Proxy Config (including PAC)
         NoProxyEnvLayer::default(),
@@ -103,17 +112,14 @@ pub async fn config_watcher_server(
         let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
             Ok(t) => {
                 if file_missing {
-                    info!("Config file reappeared: {}", path);
+                    info!(%path, "config file reappeared");
                     file_missing = false;
                 }
                 t
             }
             Err(_) => {
                 if !file_missing {
-                    warn!(
-                        "Config file not accessible: {}; keeping current config",
-                        path
-                    );
+                    warn!(%path, "config file is not accessible; keeping current config");
                     file_missing = true;
                 }
                 continue;
@@ -128,12 +134,12 @@ pub async fn config_watcher_server(
         let new_config = match Config::from_file(&path) {
             Ok(c) => c,
             Err(e) => {
-                warn!("Config reload failed: {}; keeping current config", e);
+                warn!(error = %e, "config reload failed; keeping current config");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 match Config::from_file(&path) {
                     Ok(c) => c,
                     Err(e) => {
-                        warn!("Config reload retry failed: {}; keeping current config", e);
+                        warn!(error = %e, "config reload retry failed; keeping current config");
                         continue;
                     }
                 }
@@ -156,11 +162,11 @@ pub async fn config_watcher_server(
                     Some(Arc::new(c))
                 }
                 Ok(Err(e)) => {
-                    warn!("Crypto derivation failed: {}", e);
+                    warn!(error = %e, "crypto derivation failed");
                     None
                 }
                 Err(e) => {
-                    warn!("Crypto task panicked: {}", e);
+                    warn!(error = %e, "crypto task panicked");
                     None
                 }
             }
@@ -224,7 +230,7 @@ pub async fn config_watcher_server(
             allow_transfer,
         }));
 
-        info!("Config reloaded: {}", changed.join(", "));
+        info!(fields = ?changed, "config reloaded");
     }
 }
 
@@ -252,17 +258,14 @@ pub async fn config_watcher_client(
         let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
             Ok(t) => {
                 if file_missing {
-                    info!("Config file reappeared: {}", path);
+                    info!(%path, "config file reappeared");
                     file_missing = false;
                 }
                 t
             }
             Err(_) => {
                 if !file_missing {
-                    warn!(
-                        "Config file not accessible: {}; keeping current config",
-                        path
-                    );
+                    warn!(%path, "config file is not accessible; keeping current config");
                     file_missing = true;
                 }
                 continue;
@@ -277,12 +280,12 @@ pub async fn config_watcher_client(
         let new_config = match Config::from_file(&path) {
             Ok(c) => c,
             Err(e) => {
-                warn!("Config reload failed: {}; keeping current config", e);
+                warn!(error = %e, "config reload failed; keeping current config");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 match Config::from_file(&path) {
                     Ok(c) => c,
                     Err(e) => {
-                        warn!("Config reload retry failed: {}; keeping current config", e);
+                        warn!(error = %e, "config reload retry failed; keeping current config");
                         continue;
                     }
                 }
@@ -307,11 +310,11 @@ pub async fn config_watcher_client(
                     Some(Arc::new(c))
                 }
                 Ok(Err(e)) => {
-                    warn!("Crypto derivation failed: {}", e);
+                    warn!(error = %e, "crypto derivation failed");
                     None
                 }
                 Err(e) => {
-                    warn!("Crypto task panicked: {}", e);
+                    warn!(error = %e, "crypto task panicked");
                     None
                 }
             }
@@ -344,7 +347,7 @@ pub async fn config_watcher_client(
                 }
                 Ok(_) => None,
                 Err(e) => {
-                    warn!("Invalid server URL: {}; keeping current config", e);
+                    warn!(error = %e, "invalid server URL; keeping current config");
                     None
                 }
             },
@@ -370,7 +373,7 @@ pub async fn config_watcher_client(
             http_headers,
             server_base_url,
         }));
-        info!("Config reloaded: {}", changed.join(", "));
+        info!(fields = ?changed, "config reloaded");
 
         if needs_reconnect {
             let mut sid = session_id.write().await;

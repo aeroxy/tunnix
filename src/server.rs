@@ -332,7 +332,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
                     match make_encrypted_response(&hot.crypto, &err_msg) {
                         Ok(data) => binary_response(data),
                         Err(e) => {
-                            error!("Error encrypt: {}", e);
+                            error!(error = %e, "target connection error encryption failed");
                             ok_response("error")
                         }
                     }
@@ -371,7 +371,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
                     ) {
                         Ok(data) => binary_response(data),
                         Err(e) => {
-                            error!("ACK encrypt error: {}", e);
+                            error!(error = %e, "target connection ACK encryption failed");
                             ok_response("error")
                         }
                     }
@@ -379,7 +379,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
             }
         }
         Message::Data { conn_id, data } => {
-            debug!("[{}] DATA {} bytes from client", conn_id, data.len());
+            debug!(conn_id, bytes = data.len(), "received client tunnel data");
             // Clone the writer out and drop the session lock before awaiting the
             // send. tx is a bounded channel, so holding the lock across
             // tx.send().await would freeze every other session op — and deadlock
@@ -395,7 +395,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
             ok_response("")
         }
         Message::Close { conn_id } => {
-            info!("[{}] CLOSE", conn_id);
+            info!(conn_id, "received client tunnel close");
             let mut sess = session.lock().await;
             sess.tcp_writers.remove(&conn_id);
             ok_response("")
@@ -409,7 +409,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
             term,
         } => {
             if !hot.allow_exec {
-                warn!("[{}] EXEC denied: remote exec disabled", conn_id);
+                warn!(conn_id, "remote exec denied because it is disabled");
                 return encrypted_response(
                     &hot.crypto,
                     &Message::Error {
@@ -419,17 +419,17 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
                 );
             }
             info!(
-                "[{}] EXEC {} ({}x{})",
                 conn_id,
-                if cmd.is_some() { "cmd" } else { "<shell>" },
+                mode = if cmd.is_some() { "command" } else { "shell" },
                 cols,
-                rows
+                rows,
+                "remote exec requested"
             );
             // The command may contain secrets — keep it out of normal logs.
             debug!(
-                "[{}] EXEC command: {}",
                 conn_id,
-                cmd.as_deref().unwrap_or("<shell>")
+                command = %cmd.as_deref().unwrap_or("<shell>"),
+                "remote exec command"
             );
 
             let pty_system = native_pty_system();
@@ -441,7 +441,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
             }) {
                 Ok(p) => p,
                 Err(e) => {
-                    error!("[{}] openpty failed: {}", conn_id, e);
+                    error!(conn_id, error = %e, "PTY allocation failed");
                     return encrypted_response(
                         &hot.crypto,
                         &Message::Error {
@@ -482,7 +482,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
             let child = match pair.slave.spawn_command(builder) {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("[{}] spawn failed: {}", conn_id, e);
+                    error!(conn_id, error = %e, "PTY child spawn failed");
                     return encrypted_response(
                         &hot.crypto,
                         &Message::Error {
@@ -499,7 +499,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
             let writer = match master.take_writer() {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("[{}] take writer failed: {}", conn_id, e);
+                    error!(conn_id, error = %e, "PTY writer acquisition failed");
                     return encrypted_response(
                         &hot.crypto,
                         &Message::Error {
@@ -544,8 +544,8 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
         #[cfg(not(unix))]
         Message::Exec { conn_id, .. } => {
             warn!(
-                "[{}] EXEC denied: remote exec is not supported on this platform",
-                conn_id
+                conn_id,
+                "remote exec denied because it is unsupported on this platform"
             );
             encrypted_response(
                 &hot.crypto,
@@ -561,7 +561,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
             cols,
             rows,
         } => {
-            debug!("[{}] RESIZE {}x{}", conn_id, cols, rows);
+            debug!(conn_id, cols, rows, "PTY resize requested");
             let sess = session.lock().await;
             if let Some(tx) = sess.pty_resize.get(&conn_id) {
                 let _ = tx.try_send(PtySize {
@@ -576,8 +576,8 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
         #[cfg(not(unix))]
         Message::Resize { conn_id, .. } => {
             debug!(
-                "[{}] RESIZE ignored: remote exec is not supported on this platform",
-                conn_id
+                conn_id,
+                "PTY resize ignored because remote exec is unsupported on this platform"
             );
             ok_response("")
         }
@@ -587,7 +587,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
             level,
         } => {
             if !hot.allow_transfer {
-                warn!("[{}] PULL denied: file transfer disabled", conn_id);
+                warn!(conn_id, "pull denied because file transfer is disabled");
                 return encrypted_response(
                     &hot.crypto,
                     &Message::Error {
@@ -596,7 +596,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
                     },
                 );
             }
-            info!("[{}] PULL {}", conn_id, paths.join(", "));
+            info!(conn_id, paths = ?paths, "pull requested");
             let srcs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
             let crypto = hot.crypto.clone();
             let shutdown = shutdown_guard(&state.exec);
@@ -614,7 +614,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
         }
         Message::Push { conn_id, path } => {
             if !hot.allow_transfer {
-                warn!("[{}] PUSH denied: file transfer disabled", conn_id);
+                warn!(conn_id, "push denied because file transfer is disabled");
                 return encrypted_response(
                     &hot.crypto,
                     &Message::Error {
@@ -623,7 +623,7 @@ async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Res
                     },
                 );
             }
-            info!("[{}] PUSH -> {}", conn_id, path);
+            info!(conn_id, destination = %path, "push requested");
             // Register the decompressor's input as this conn's writer: the
             // existing Data handler forwards incoming chunks to it, and the
             // Close handler drops it (EOF) when the client finishes streaming.
@@ -664,7 +664,7 @@ fn encrypted_response(crypto: &Crypto, msg: &Message) -> Response {
     match make_encrypted_response(crypto, msg) {
         Ok(data) => binary_response(data),
         Err(e) => {
-            error!("Encrypt response error: {}", e);
+            error!(error = %e, "response encryption failed");
             ok_response("error")
         }
     }
@@ -702,11 +702,11 @@ async fn relay_tcp_connection(
         loop {
             match tcp_read.read(&mut buf).await {
                 Ok(0) => {
-                    debug!("[{}] TCP EOF", conn_id);
+                    debug!(conn_id, "target reached EOF");
                     return Ok::<(), String>(());
                 }
                 Ok(n) => {
-                    debug!("[{}] TCP -> SSE {} bytes", conn_id, n);
+                    debug!(conn_id, bytes = n, "relaying target data to SSE");
                     let msg = Message::Data {
                         conn_id,
                         data: buf[..n].to_vec(),
@@ -768,9 +768,13 @@ async fn relay_tcp_connection(
             if data.is_empty() {
                 continue;
             }
-            debug!("[{}] Client -> TCP {} bytes", conn_id, data.len());
+            debug!(
+                conn_id,
+                bytes = data.len(),
+                "relaying client data to target"
+            );
             if let Err(e) = tcp_write.write_all(&data).await {
-                error!("[{}] TCP write error: {}", conn_id, e);
+                error!(conn_id, error = %e, "target write failed");
                 break;
             }
         }
@@ -926,7 +930,7 @@ async fn relay_pty_connection(
     let (read_afd, write_afd) = match setup {
         Ok(pair) => pair,
         Err(e) => {
-            error!("[{}] PTY async setup failed: {}", conn_id, e);
+            error!(conn_id, error = %e, "PTY async setup failed");
             let sse_tx = {
                 let mut sess = session.lock().await;
                 sess.tcp_writers.remove(&conn_id);
@@ -1083,7 +1087,7 @@ async fn relay_pty_connection(
                 break (&mut wait_handle).await.unwrap_or(-1);
             }
             _ = &mut sse_dead => {
-                debug!("[{}] SSE stream closed continuously; killing orphaned PTY child", conn_id);
+                debug!(conn_id, "SSE remained closed; killing orphaned PTY child");
                 let _ = killer.kill();
                 client_gone = true;
                 break (&mut wait_handle).await.unwrap_or(-1);
@@ -1091,7 +1095,7 @@ async fn relay_pty_connection(
             new_size = resize_rx.recv() => {
                 if let Some(s) = new_size {
                     if let Err(e) = master.resize(s) {
-                        error!("[{}] PTY resize failed: {}", conn_id, e);
+                        error!(conn_id, error = %e, "PTY resize failed");
                     }
                 }
             }
@@ -1109,8 +1113,8 @@ async fn relay_pty_connection(
         .is_err()
     {
         debug!(
-            "[{}] PTY read loop still pending (background process holding the pty?); aborting",
-            conn_id
+            conn_id,
+            "PTY read loop still pending, possibly because a background process holds it; aborting"
         );
         read_task.abort();
         let _ = read_task.await;
@@ -1156,7 +1160,7 @@ async fn relay_pty_connection(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 if !sent && !client_gone {
-                    error!("[{}] failed to deliver shutdown message", conn_id);
+                    error!(conn_id, "PTY shutdown message delivery failed");
                 }
             }
         }
@@ -1169,7 +1173,7 @@ async fn relay_pty_connection(
         sess.pty_resize.remove(&conn_id);
     }
 
-    info!("[{}] PTY session closed (exit {})", conn_id, code);
+    info!(conn_id, exit_code = code, "PTY session closed");
 }
 
 /// Encrypt one PTY chunk and push it to the (possibly-reconnected) SSE sender.
@@ -1186,14 +1190,14 @@ async fn forward_pty_chunk(
     let bytes = match msg.to_bytes() {
         Ok(b) => b,
         Err(e) => {
-            error!("[{}] PTY serialize: {}", conn_id, e);
+            error!(conn_id, error = %e, "PTY data serialization failed");
             return false;
         }
     };
     let encrypted = match crypto.encrypt(&bytes) {
         Ok(e) => e,
         Err(e) => {
-            error!("[{}] PTY encrypt: {}", conn_id, e);
+            error!(conn_id, error = %e, "PTY data encryption failed");
             return false;
         }
     };
@@ -1211,10 +1215,10 @@ async fn forward_pty_chunk(
         {
             return true;
         }
-        debug!("[{}] SSE stream replaced or closed; retrying", conn_id);
+        debug!(conn_id, "SSE stream replaced or closed; retrying");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    error!("[{}] SSE reconnect timed out; dropping PTY output", conn_id);
+    error!(conn_id, "SSE reconnect timed out; dropping PTY output");
     false
 }
 
@@ -1320,9 +1324,12 @@ async fn relay_pull(
     };
 
     if client_gone {
-        debug!("[{}] PULL aborted: client connection lost", conn_id);
+        debug!(
+            conn_id,
+            "pull aborted because the client connection was lost"
+        );
     } else if let Err(message) = result {
-        error!("[{}] PULL failed: {}", conn_id, message);
+        error!(conn_id, error = %message, "pull failed");
         let _ = send_to_client(
             conn_id,
             &Message::Error {
@@ -1346,7 +1353,7 @@ async fn relay_pull(
         {
             let _ = send_to_client(conn_id, &Message::Close { conn_id }, &crypto, &session).await;
         }
-        info!("[{}] PULL complete", conn_id);
+        info!(conn_id, "pull complete");
     }
 }
 
@@ -1390,7 +1397,7 @@ async fn relay_push(
             (&mut unpack_handle).await
         }
         _ = watchdog => {
-            debug!("[{}] PUSH watchdog: SSE gone; forcing EOF on stalled unpack", conn_id);
+            debug!(conn_id, "push watchdog forcing EOF after SSE loss");
             // Drop the writer so the decompressor sees EOF and unblocks.
             session.lock().await.tcp_writers.remove(&conn_id);
             (&mut unpack_handle).await
@@ -1424,10 +1431,10 @@ async fn relay_push(
                 let _ =
                     send_to_client(conn_id, &Message::Close { conn_id }, &crypto, &session).await;
             }
-            info!("[{}] PUSH complete", conn_id);
+            info!(conn_id, "push complete");
         }
         Err(message) => {
-            error!("[{}] PUSH failed: {}", conn_id, message);
+            error!(conn_id, error = %message, "push failed");
             let _ = send_to_client(
                 conn_id,
                 &Message::Error {

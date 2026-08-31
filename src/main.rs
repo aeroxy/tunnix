@@ -265,10 +265,13 @@ async fn main() -> Result<()> {
             }
 
             if let Some(ref log_path) = args.log {
-                info!("Log file: {}", log_path);
+                info!(path = %log_path, "file logging enabled");
             }
 
-            info!("tunnix server v{}", env!("CARGO_PKG_VERSION"));
+            info!(
+                version = env!("CARGO_PKG_VERSION"),
+                "tunnix server starting"
+            );
             info!(listen_addr = %config.server.listen, "server configured");
             let path_prefix = normalize_path_prefix(config.server.path_prefix.as_ref())?;
             if let Some(prefix) = &path_prefix {
@@ -282,7 +285,7 @@ async fn main() -> Result<()> {
             }
 
             let crypto = Arc::new(Crypto::new(&config.server.password)?);
-            info!("Encryption initialized");
+            info!("encryption initialized");
 
             let hot = HotServerConfig {
                 crypto,
@@ -330,11 +333,14 @@ async fn main() -> Result<()> {
                 .expect("Failed to install rustls crypto provider");
 
             if let Some(ref log_path) = args.log {
-                info!("Log file: {}", log_path);
+                info!(path = %log_path, "file logging enabled");
             }
 
-            info!("tunnix client v{}", env!("CARGO_PKG_VERSION"));
-            info!("Server: {}", server_url);
+            info!(
+                version = env!("CARGO_PKG_VERSION"),
+                "tunnix client starting"
+            );
+            info!(server_url = %server_url, "tunnel server configured");
             info!(
                 local_addr = %config.client.local_addr,
                 protocols = "socks5,http",
@@ -342,7 +348,7 @@ async fn main() -> Result<()> {
             );
 
             let crypto = Arc::new(Crypto::new(&config.client.password)?);
-            info!("Encryption initialized");
+            info!("encryption initialized");
 
             let shutdown = Shutdown::default();
             let exec = Executor::graceful(shutdown.guard());

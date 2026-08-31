@@ -104,7 +104,7 @@ async fn session(
         let sender_task = tokio::spawn(async move {
             while let Some(msg) = msg_rx.recv().await {
                 if let Err(e) = sender_tunnel.send_message(&msg).await {
-                    debug!("send_message failed: {}", e);
+                    debug!(error = %e, "send_message failed");
                     break;
                 }
             }
@@ -164,7 +164,7 @@ async fn session(
                             }
                         }
                         Err(e) => {
-                            debug!("stdin read error: {}", e);
+                            debug!(error = %e, "stdin read failed");
                             stdin_open = false;
                         }
                     }

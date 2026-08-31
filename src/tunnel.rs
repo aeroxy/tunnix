@@ -179,8 +179,8 @@ impl Tunnel {
         // race ahead of it (otherwise: 503 "unknown session").
         if tokio::time::timeout(RECONNECT_WAIT, ready).await.is_err() {
             warn!(
-                "SSE stream not ready after {:?}; proceeding anyway",
-                RECONNECT_WAIT
+                timeout_seconds = RECONNECT_WAIT.as_secs(),
+                "SSE stream not ready; proceeding anyway"
             );
         }
 
@@ -239,10 +239,8 @@ impl Tunnel {
         // `data:` frame is processed: a new session's first data frame is
         // `Reset` (which clears pending channels), and handling it before
         // `connect()` returns ensures the first registration + POST can't be
-        // wiped by a late Reset. We can't just wait for the first chunk: the
-        // server's keepalive `:\n\n` comment can be emitted ahead of the
-        // queued Reset (its interval's first tick is immediate), so only a
-        // real data frame guarantees the Reset is consumed.
+        // wiped by a late Reset. Only a real data frame proves that Reset was
+        // consumed; transport readiness or a comment does not.
         //
         // On reconnects the server won't queue a Reset, so the first event may
         // be a keepalive; signal on any event to avoid stalling send_message
@@ -366,12 +364,9 @@ impl Tunnel {
                 let count = channels.len();
                 channels.clear();
                 if count > 0 {
-                    warn!(
-                        "Server session reset: tearing down {} pending connection(s)",
-                        count
-                    );
+                    warn!(pending_connections = count, "server session reset");
                 } else {
-                    debug!("Server session reset (no pending connections)");
+                    debug!("server session reset with no pending connections");
                 }
             }
             Message::Pong => debug!("PONG"),
@@ -399,10 +394,7 @@ impl Tunnel {
                 // reconnect instead of racing to rotate (the old "death
                 // spiral"), and preserves in-flight server relays when the
                 // server didn't actually restart.
-                warn!(
-                    "send failed: {}; forcing SSE reconnect and retrying",
-                    first_err
-                );
+                warn!(error = %first_err, "send failed; forcing SSE reconnect and retrying");
                 // Register interest BEFORE signaling, so the SSE task can't
                 // win the race and fire sse_ready between notify_one and our
                 // first poll.
