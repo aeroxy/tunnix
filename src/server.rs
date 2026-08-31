@@ -704,25 +704,23 @@ async fn relay_tcp_connection(
             session.lock().await.tcp_writers.remove(&conn_id);
         }
         let close = Message::Close { conn_id };
-        if let Ok(bytes) = close.to_bytes() {
-            if let Ok(encrypted) = crypto.encrypt(&bytes) {
-                let sse_tx = {
-                    let sess = session.lock().await;
-                    sess.sse_tx.clone()
-                };
-                // Best-effort Close; bound it so a half-open client can't hang
-                // teardown on the full-but-undrained bounded channel.
-                let _ =
-                    tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted)).await;
-            }
-        }
         if target_output_closed_first {
             // Data frames from the completed read future were queued before
-            // Close. Continue draining already-accepted client input without
-            // making the client's EOF depend on the target reading it all.
+            // Close. Deliver Close with the same reconnect-aware retry policy,
+            // while draining accepted input independently.
             tokio::select! {
                 _ = shutdown.cancelled() => {},
-                _ = &mut write => {},
+                _ = async {
+                    let _ = tokio::join!(
+                        send_to_client(conn_id, &close, &crypto, &session),
+                        write.as_mut(),
+                    );
+                } => {},
+            }
+        } else {
+            tokio::select! {
+                _ = shutdown.cancelled() => {},
+                _ = send_to_client(conn_id, &close, &crypto, &session) => {},
             }
         }
     }
@@ -1065,15 +1063,15 @@ async fn forward_pty_chunk(
 
 /// Encrypt `msg` and push it to the (possibly-reconnected) SSE sender, retrying
 /// briefly across a client reconnect. Returns false if it could not be
-/// delivered. Cross-platform sibling of `forward_pty_chunk`, used by transfers.
+/// delivered. Used by TCP teardown and transfer relays.
 async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
     let bytes = match msg.to_bytes() {
         Ok(b) => b,
-        Err(e) => { error!("[{}] transfer serialize: {}", conn_id, e); return false; }
+        Err(e) => { error!(conn_id, error = %e, "client message serialization failed"); return false; }
     };
     let encrypted = match crypto.encrypt(&bytes) {
         Ok(e) => e,
-        Err(e) => { error!("[{}] transfer encrypt: {}", conn_id, e); return false; }
+        Err(e) => { error!(conn_id, error = %e, "client message encryption failed"); return false; }
     };
     for _ in 0..50 {
         let sse_tx = {
@@ -1091,6 +1089,7 @@ async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    error!(conn_id, "client message delivery retries exhausted");
     false
 }
 
@@ -1292,5 +1291,38 @@ mod tests {
             status(&service, Method::POST, "/tunnix/health").await,
             StatusCode::METHOD_NOT_ALLOWED
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_message_retries_a_temporarily_full_sse_queue() {
+        let (sse_tx, mut sse_rx) = mpsc::channel(1);
+        sse_tx.send(vec![0]).await.unwrap();
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }));
+        let crypto = Crypto::new("test-password").unwrap();
+        let message = Message::Close { conn_id: 7 };
+
+        let release_queue = async {
+            // The first attempt times out at 500 ms. Only then free capacity,
+            // proving the terminal frame is retried rather than dropped.
+            tokio::time::sleep(Duration::from_millis(550)).await;
+            assert_eq!(sse_rx.recv().await.unwrap(), vec![0]);
+            sse_rx.recv().await.unwrap()
+        };
+        let (sent, encrypted) = tokio::join!(
+            send_to_client(7, &message, &crypto, &session),
+            release_queue,
+        );
+
+        assert!(sent);
+        let plaintext = crypto.decrypt(&encrypted).unwrap();
+        assert!(matches!(
+            Message::from_bytes(&plaintext).unwrap(),
+            Message::Close { conn_id: 7 }
+        ));
     }
 }
