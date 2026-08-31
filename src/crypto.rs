@@ -54,8 +54,8 @@ impl Crypto {
 
         let params = ParamsBuilder::new()
             .m_cost(19456) // 19 MB memory
-            .t_cost(2)     // 2 iterations
-            .p_cost(1)     // 1 thread
+            .t_cost(2) // 2 iterations
+            .p_cost(1) // 1 thread
             .build()
             .map_err(|e| CryptoError::KeyDerivationFailed(e.to_string()))?;
 

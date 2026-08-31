@@ -65,11 +65,6 @@ pub fn build_http_client(exec: Executor) -> HttpClient {
         .with_proxy_support()
         .with_tls_support_using_rustls(tls)
         .with_default_http_connector(exec)
-        // max_total counts active plus idle connections; idle entries are
-        // evicted first, but the default of 50 can still block when all 50 are
-        // active (the long-lived HTTP/1 SSE response occupies one). Keep the
-        // wait within the tunnel's reconnect horizon. Rama 0.5-dev #1141
-        // improves pool reuse and waiter wakeups further.
         .try_with_connection_pool(HttpPooledConnectorConfig {
             max_total: CONTROL_PLANE_POOL_MAX_CONNECTIONS,
             wait_for_pool_timeout: Some(CONTROL_PLANE_POOL_WAIT_TIMEOUT),
@@ -79,6 +74,8 @@ pub fn build_http_client(exec: Executor) -> HttpClient {
         .build_client();
 
     let client = (
+        // NOTE: If desired we can also add here rama's
+        // support for System Proxy Config (including PAC)
         NoProxyEnvLayer::default(),
         ProxyEnvLayer::default(),
         ProxyRoutesLayer::new(),

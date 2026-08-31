@@ -1,23 +1,28 @@
+use crate::archive::{spawn_compress, spawn_decompress};
+use crate::crypto::Crypto;
+use crate::protocol::Message;
+use crate::reload::{CliOverrides, HotServerConfig};
 use anyhow::Result;
 use arc_swap::ArcSwap;
+#[cfg(unix)]
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use rama::{
-    Layer, Service,
     bytes::Bytes,
     futures::stream,
     graceful::{Shutdown, ShutdownGuard},
     http::{
-        HeaderName, HeaderValue, Request, Response, StatusCode,
         body::util::BodyExt,
+        headers::Location,
         layer::trace::TraceLayer,
         server::HttpServer,
         service::web::{
-            Router,
             extract::{Path, State},
             response::{Headers, Html, IntoResponse, Sse},
             router::RouterError,
+            Router,
         },
-        headers::Location,
-        sse::{Event, server::KeepAlive},
+        sse::{server::KeepAlive, Event},
+        HeaderName, HeaderValue, Request, Response, StatusCode,
     },
     net::address::SocketAddress,
     rt::Executor,
@@ -25,21 +30,16 @@ use rama::{
     tcp::server::TcpListener,
     telemetry::tracing::{debug, error, info, warn},
     utils::octets::kib,
+    Layer, Service,
 };
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(unix)]
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
-use crate::archive::{spawn_compress, spawn_decompress};
-use crate::crypto::Crypto;
-use crate::protocol::Message;
-use crate::reload::{CliOverrides, HotServerConfig};
 
 struct Session {
     /// Per-conn_id sink for client→target bytes. Covers both TCP connections and
@@ -193,11 +193,9 @@ fn service_unavailable_response(msg: &'static str) -> Response {
 async fn root_response(hot: &HotServerConfig) -> Response {
     if let Some(url) = &hot.root_redirect {
         return match Location::try_from(url) {
-            Ok(location) => (
-                Headers::single(location),
-                StatusCode::MOVED_PERMANENTLY,
-            )
-                .into_response(),
+            Ok(location) => {
+                (Headers::single(location), StatusCode::MOVED_PERMANENTLY).into_response()
+            }
             Err(error) => {
                 error!(%url, %error, "invalid root redirect");
                 service_unavailable_response("invalid root redirect")
@@ -286,11 +284,7 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response {
 }
 
 /// Handle encrypted message from client
-async fn handle_send(
-    session_id: &str,
-    body: &Bytes,
-    state: &ServerState,
-) -> Response {
+async fn handle_send(session_id: &str, body: &Bytes, state: &ServerState) -> Response {
     let hot = state.hot.load();
 
     let session = {
@@ -321,7 +315,11 @@ async fn handle_send(
     };
 
     match message {
-        Message::Connect { conn_id, host, port } => {
+        Message::Connect {
+            conn_id,
+            host,
+            port,
+        } => {
             info!(conn_id, %host, port, "connecting tunnel target");
 
             match TcpStream::connect((host.as_str(), port)).await {
@@ -353,15 +351,23 @@ async fn handle_send(
                     let shutdown = shutdown_guard(&state.exec);
                     state.exec.spawn_task(async move {
                         relay_tcp_connection(
-                            conn_id, (&host, port), (tcp_read, tcp_write), write_rx,
-                            session, crypto, shutdown,
+                            conn_id,
+                            (&host, port),
+                            (tcp_read, tcp_write),
+                            write_rx,
+                            session,
+                            crypto,
+                            shutdown,
                         )
                         .await;
                     });
 
                     match make_encrypted_response(
                         &hot.crypto,
-                        &Message::Data { conn_id, data: vec![] },
+                        &Message::Data {
+                            conn_id,
+                            data: vec![],
+                        },
                     ) {
                         Ok(data) => binary_response(data),
                         Err(e) => {
@@ -395,7 +401,13 @@ async fn handle_send(
             ok_response("")
         }
         #[cfg(unix)]
-        Message::Exec { conn_id, cmd, cols, rows, term } => {
+        Message::Exec {
+            conn_id,
+            cmd,
+            cols,
+            rows,
+            term,
+        } => {
             if !hot.allow_exec {
                 warn!("[{}] EXEC denied: remote exec disabled", conn_id);
                 return encrypted_response(
@@ -406,18 +418,36 @@ async fn handle_send(
                     },
                 );
             }
-            info!("[{}] EXEC {} ({}x{})", conn_id, if cmd.is_some() { "cmd" } else { "<shell>" }, cols, rows);
+            info!(
+                "[{}] EXEC {} ({}x{})",
+                conn_id,
+                if cmd.is_some() { "cmd" } else { "<shell>" },
+                cols,
+                rows
+            );
             // The command may contain secrets — keep it out of normal logs.
-            debug!("[{}] EXEC command: {}", conn_id, cmd.as_deref().unwrap_or("<shell>"));
+            debug!(
+                "[{}] EXEC command: {}",
+                conn_id,
+                cmd.as_deref().unwrap_or("<shell>")
+            );
 
             let pty_system = native_pty_system();
-            let pair = match pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }) {
+            let pair = match pty_system.openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
                 Ok(p) => p,
                 Err(e) => {
                     error!("[{}] openpty failed: {}", conn_id, e);
                     return encrypted_response(
                         &hot.crypto,
-                        &Message::Error { conn_id: Some(conn_id), message: format!("openpty failed: {}", e) },
+                        &Message::Error {
+                            conn_id: Some(conn_id),
+                            message: format!("openpty failed: {}", e),
+                        },
                     );
                 }
             };
@@ -433,10 +463,21 @@ async fn handle_send(
                     // Fall back to /bin/sh when SHELL is unset OR set-but-empty;
                     // an empty program name would make the spawn fail with ENOENT.
                     let shell = std::env::var("SHELL").unwrap_or_default();
-                    CommandBuilder::new(if shell.is_empty() { "/bin/sh".to_string() } else { shell })
+                    CommandBuilder::new(if shell.is_empty() {
+                        "/bin/sh".to_string()
+                    } else {
+                        shell
+                    })
                 }
             };
-            builder.env("TERM", if term.is_empty() { "xterm-256color".to_string() } else { term });
+            builder.env(
+                "TERM",
+                if term.is_empty() {
+                    "xterm-256color".to_string()
+                } else {
+                    term
+                },
+            );
 
             let child = match pair.slave.spawn_command(builder) {
                 Ok(c) => c,
@@ -444,7 +485,10 @@ async fn handle_send(
                     error!("[{}] spawn failed: {}", conn_id, e);
                     return encrypted_response(
                         &hot.crypto,
-                        &Message::Error { conn_id: Some(conn_id), message: format!("spawn failed: {}", e) },
+                        &Message::Error {
+                            conn_id: Some(conn_id),
+                            message: format!("spawn failed: {}", e),
+                        },
                     );
                 }
             };
@@ -458,7 +502,10 @@ async fn handle_send(
                     error!("[{}] take writer failed: {}", conn_id, e);
                     return encrypted_response(
                         &hot.crypto,
-                        &Message::Error { conn_id: Some(conn_id), message: format!("pty writer failed: {}", e) },
+                        &Message::Error {
+                            conn_id: Some(conn_id),
+                            message: format!("pty writer failed: {}", e),
+                        },
                     );
                 }
             };
@@ -474,14 +521,32 @@ async fn handle_send(
             let crypto = hot.crypto.clone();
             let shutdown = shutdown_guard(&state.exec);
             state.exec.spawn_task(async move {
-                relay_pty_connection(conn_id, (master, writer, child), write_rx, resize_rx, session, crypto, shutdown).await;
+                relay_pty_connection(
+                    conn_id,
+                    (master, writer, child),
+                    write_rx,
+                    resize_rx,
+                    session,
+                    crypto,
+                    shutdown,
+                )
+                .await;
             });
 
-            encrypted_response(&hot.crypto, &Message::Data { conn_id, data: vec![] })
+            encrypted_response(
+                &hot.crypto,
+                &Message::Data {
+                    conn_id,
+                    data: vec![],
+                },
+            )
         }
         #[cfg(not(unix))]
         Message::Exec { conn_id, .. } => {
-            warn!("[{}] EXEC denied: remote exec is not supported on this platform", conn_id);
+            warn!(
+                "[{}] EXEC denied: remote exec is not supported on this platform",
+                conn_id
+            );
             encrypted_response(
                 &hot.crypto,
                 &Message::Error {
@@ -491,20 +556,36 @@ async fn handle_send(
             )
         }
         #[cfg(unix)]
-        Message::Resize { conn_id, cols, rows } => {
+        Message::Resize {
+            conn_id,
+            cols,
+            rows,
+        } => {
             debug!("[{}] RESIZE {}x{}", conn_id, cols, rows);
             let sess = session.lock().await;
             if let Some(tx) = sess.pty_resize.get(&conn_id) {
-                let _ = tx.try_send(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                let _ = tx.try_send(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
             }
             ok_response("")
         }
         #[cfg(not(unix))]
         Message::Resize { conn_id, .. } => {
-            debug!("[{}] RESIZE ignored: remote exec is not supported on this platform", conn_id);
+            debug!(
+                "[{}] RESIZE ignored: remote exec is not supported on this platform",
+                conn_id
+            );
             ok_response("")
         }
-        Message::Pull { conn_id, paths, level } => {
+        Message::Pull {
+            conn_id,
+            paths,
+            level,
+        } => {
             if !hot.allow_transfer {
                 warn!("[{}] PULL denied: file transfer disabled", conn_id);
                 return encrypted_response(
@@ -523,7 +604,13 @@ async fn handle_send(
                 relay_pull(conn_id, srcs, level, session, crypto, shutdown).await;
             });
             // ACK so the client starts unpacking; the archive follows over SSE.
-            encrypted_response(&hot.crypto, &Message::Data { conn_id, data: vec![] })
+            encrypted_response(
+                &hot.crypto,
+                &Message::Data {
+                    conn_id,
+                    data: vec![],
+                },
+            )
         }
         Message::Push { conn_id, path } => {
             if !hot.allow_transfer {
@@ -550,14 +637,18 @@ async fn handle_send(
             state.exec.spawn_task(async move {
                 relay_push(conn_id, unpack_handle, session, crypto, shutdown).await;
             });
-            encrypted_response(&hot.crypto, &Message::Data { conn_id, data: vec![] })
+            encrypted_response(
+                &hot.crypto,
+                &Message::Data {
+                    conn_id,
+                    data: vec![],
+                },
+            )
         }
-        Message::Ping => {
-            match make_encrypted_response(&hot.crypto, &Message::Pong) {
-                Ok(data) => binary_response(data),
-                Err(_) => ok_response(""),
-            }
-        }
+        Message::Ping => match make_encrypted_response(&hot.crypto, &Message::Pong) {
+            Ok(data) => binary_response(data),
+            Err(_) => ok_response(""),
+        },
         _ => ok_response(""),
     }
 }
@@ -647,9 +738,12 @@ async fn relay_tcp_connection(
                             let sess = session_clone.lock().await;
                             sess.sse_tx.clone()
                         };
-                        if tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted.clone()))
-                            .await
-                            .is_ok_and(|r| r.is_ok())
+                        if tokio::time::timeout(
+                            Duration::from_millis(500),
+                            sse_tx.send(encrypted.clone()),
+                        )
+                        .await
+                        .is_ok_and(|r| r.is_ok())
                         {
                             delivered = true;
                             break;
@@ -847,7 +941,9 @@ async fn relay_pty_connection(
                 if let Ok(encrypted) = crypto.encrypt(&bytes) {
                     // Best-effort error report; bound it so a half-open client
                     // can't hang on the full-but-undrained bounded channel.
-                    let _ = tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted)).await;
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted))
+                            .await;
                 }
             }
             return;
@@ -881,7 +977,9 @@ async fn relay_pty_connection(
                 }) {
                     Ok(Ok(0)) => break, // EOF: slave fully closed
                     Ok(Ok(n)) => {
-                        if !forward_pty_chunk(conn_id, buf[..n].to_vec(), &crypto_fwd, &session_fwd).await {
+                        if !forward_pty_chunk(conn_id, buf[..n].to_vec(), &crypto_fwd, &session_fwd)
+                            .await
+                        {
                             break;
                         }
                     }
@@ -936,11 +1034,10 @@ async fn relay_pty_connection(
 
     // Wait for the child; if the client side closes first, kill it.
     let mut killer = child.clone_killer();
-    let mut wait_handle =
-        tokio::task::spawn_blocking(move || {
-            let mut child = child;
-            child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1)
-        });
+    let mut wait_handle = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1)
+    });
 
     // Watchdog: an abrupt client disconnect (network drop, process killed)
     // leaves write_tx in tcp_writers, so write_blocking never finishes and the
@@ -1007,8 +1104,14 @@ async fn relay_pty_connection(
     // async task: if a backgrounded process keeps the slave open so EOF never
     // arrives, abort() cancels it immediately — no blocking thread is left
     // parked in read() as the old spawn_blocking reader would have been.
-    if tokio::time::timeout(Duration::from_secs(2), &mut read_task).await.is_err() {
-        debug!("[{}] PTY read loop still pending (background process holding the pty?); aborting", conn_id);
+    if tokio::time::timeout(Duration::from_secs(2), &mut read_task)
+        .await
+        .is_err()
+    {
+        debug!(
+            "[{}] PTY read loop still pending (background process holding the pty?); aborting",
+            conn_id
+        );
         read_task.abort();
         let _ = read_task.await;
     }
@@ -1040,9 +1143,12 @@ async fn relay_pty_connection(
                     // channel's receiver alive-but-undrained, so send() would
                     // park forever and defeat the re-fetch above. On timeout,
                     // fall through to re-lock and pick up a reconnected sender.
-                    if tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted.clone()))
-                        .await
-                        .is_ok_and(|r| r.is_ok())
+                    if tokio::time::timeout(
+                        Duration::from_millis(500),
+                        sse_tx.send(encrypted.clone()),
+                    )
+                    .await
+                    .is_ok_and(|r| r.is_ok())
                     {
                         sent = true;
                         break;
@@ -1079,11 +1185,17 @@ async fn forward_pty_chunk(
     let msg = Message::Data { conn_id, data };
     let bytes = match msg.to_bytes() {
         Ok(b) => b,
-        Err(e) => { error!("[{}] PTY serialize: {}", conn_id, e); return false; }
+        Err(e) => {
+            error!("[{}] PTY serialize: {}", conn_id, e);
+            return false;
+        }
     };
     let encrypted = match crypto.encrypt(&bytes) {
         Ok(e) => e,
-        Err(e) => { error!("[{}] PTY encrypt: {}", conn_id, e); return false; }
+        Err(e) => {
+            error!("[{}] PTY encrypt: {}", conn_id, e);
+            return false;
+        }
     };
     for _ in 0..50 {
         let sse_tx = {
@@ -1109,7 +1221,12 @@ async fn forward_pty_chunk(
 /// Encrypt `msg` and push it to the (possibly-reconnected) SSE sender, retrying
 /// briefly across a client reconnect. Returns false if it could not be
 /// delivered. Used by TCP teardown and transfer relays.
-async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
+async fn send_to_client(
+    conn_id: u32,
+    msg: &Message,
+    crypto: &Crypto,
+    session: &Arc<Mutex<Session>>,
+) -> bool {
     let sent = send_to_client_with_retry_limit(conn_id, msg, crypto, session, 50).await;
     if !sent {
         error!(conn_id, "client message delivery retries exhausted");
@@ -1126,11 +1243,17 @@ async fn send_to_client_with_retry_limit(
 ) -> bool {
     let bytes = match msg.to_bytes() {
         Ok(b) => b,
-        Err(e) => { error!(conn_id, error = %e, "client message serialization failed"); return false; }
+        Err(e) => {
+            error!(conn_id, error = %e, "client message serialization failed");
+            return false;
+        }
     };
     let encrypted = match crypto.encrypt(&bytes) {
         Ok(e) => e,
-        Err(e) => { error!(conn_id, error = %e, "client message encryption failed"); return false; }
+        Err(e) => {
+            error!(conn_id, error = %e, "client message encryption failed");
+            return false;
+        }
     };
     for attempt in 0..retry_limit {
         let sse_tx = {
@@ -1202,7 +1325,10 @@ async fn relay_pull(
         error!("[{}] PULL failed: {}", conn_id, message);
         let _ = send_to_client(
             conn_id,
-            &Message::Error { conn_id: Some(conn_id), message },
+            &Message::Error {
+                conn_id: Some(conn_id),
+                message,
+            },
             &crypto,
             &session,
         )
@@ -1210,7 +1336,14 @@ async fn relay_pull(
     } else {
         // Only attempt Close if ExitStatus landed: a false return means the
         // client is permanently gone, so a second 5s retry round is wasted.
-        if send_to_client(conn_id, &Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await {
+        if send_to_client(
+            conn_id,
+            &Message::ExitStatus { conn_id, code: 0 },
+            &crypto,
+            &session,
+        )
+        .await
+        {
             let _ = send_to_client(conn_id, &Message::Close { conn_id }, &crypto, &session).await;
         }
         info!("[{}] PULL complete", conn_id);
@@ -1280,8 +1413,16 @@ async fn relay_push(
         Ok(()) => {
             // Skip Close if ExitStatus failed — the client is gone and a
             // second 5s retry round would just delay task cleanup.
-            if send_to_client(conn_id, &Message::ExitStatus { conn_id, code: 0 }, &crypto, &session).await {
-                let _ = send_to_client(conn_id, &Message::Close { conn_id }, &crypto, &session).await;
+            if send_to_client(
+                conn_id,
+                &Message::ExitStatus { conn_id, code: 0 },
+                &crypto,
+                &session,
+            )
+            .await
+            {
+                let _ =
+                    send_to_client(conn_id, &Message::Close { conn_id }, &crypto, &session).await;
             }
             info!("[{}] PUSH complete", conn_id);
         }
@@ -1289,7 +1430,10 @@ async fn relay_push(
             error!("[{}] PUSH failed: {}", conn_id, message);
             let _ = send_to_client(
                 conn_id,
-                &Message::Error { conn_id: Some(conn_id), message },
+                &Message::Error {
+                    conn_id: Some(conn_id),
+                    message,
+                },
                 &crypto,
                 &session,
             )

@@ -14,7 +14,9 @@ fn find_free_port() -> u16 {
 /// Perform a raw GET /health and check for 200
 fn health_check(port: u16) -> bool {
     let addr = format!("127.0.0.1:{}", port);
-    if let Ok(mut stream) = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(1)) {
+    if let Ok(mut stream) =
+        TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(1))
+    {
         let req = "GET /health HTTP/1.0\r\n\r\n";
         let _ = stream.write_all(req.as_bytes());
         let mut resp = String::new();

@@ -11,7 +11,9 @@ fn find_free_port() -> u16 {
 
 fn health_check(port: u16) -> bool {
     let addr = format!("127.0.0.1:{}", port);
-    if let Ok(mut stream) = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(1)) {
+    if let Ok(mut stream) =
+        TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(1))
+    {
         let req = "GET /health HTTP/1.0\r\n\r\n";
         let _ = stream.write_all(req.as_bytes());
         let mut resp = String::new();
@@ -104,27 +106,43 @@ fn test_push_pull_roundtrip() {
     // --- push: src -> server-side `remote/` (unpacks to remote/src/...) ---
     let remote = tmp.join("remote");
     assert!(
-        run_transfer(bin, port, "push", &[src.to_str().unwrap(), remote.to_str().unwrap()]),
+        run_transfer(
+            bin,
+            port,
+            "push",
+            &[src.to_str().unwrap(), remote.to_str().unwrap()]
+        ),
         "push failed"
     );
     assert_eq!(
         std::fs::read(remote.join("src/a.txt")).unwrap(),
         b"hello transfer"
     );
-    assert_eq!(std::fs::read(remote.join("src/nested/big.bin")).unwrap(), big);
+    assert_eq!(
+        std::fs::read(remote.join("src/nested/big.bin")).unwrap(),
+        big
+    );
 
     // --- pull: server-side `remote/src` -> local `pulled/` ---
     let pulled = tmp.join("pulled");
     let remote_src = remote.join("src");
     assert!(
-        run_transfer(bin, port, "pull", &[remote_src.to_str().unwrap(), pulled.to_str().unwrap()]),
+        run_transfer(
+            bin,
+            port,
+            "pull",
+            &[remote_src.to_str().unwrap(), pulled.to_str().unwrap()]
+        ),
         "pull failed"
     );
     assert_eq!(
         std::fs::read(pulled.join("src/a.txt")).unwrap(),
         b"hello transfer"
     );
-    assert_eq!(std::fs::read(pulled.join("src/nested/big.bin")).unwrap(), big);
+    assert_eq!(
+        std::fs::read(pulled.join("src/nested/big.bin")).unwrap(),
+        big
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -166,7 +184,10 @@ fn test_push_pull_multiple_sources() {
     );
     assert_eq!(std::fs::read(remote.join("one.txt")).unwrap(), b"first");
     assert_eq!(std::fs::read(remote.join("two.txt")).unwrap(), b"second");
-    assert_eq!(std::fs::read(remote.join("dir/inner.txt")).unwrap(), b"nested");
+    assert_eq!(
+        std::fs::read(remote.join("dir/inner.txt")).unwrap(),
+        b"nested"
+    );
 
     // pull the three back together -> pulled/
     let pulled = tmp.join("pulled");
@@ -186,7 +207,10 @@ fn test_push_pull_multiple_sources() {
     );
     assert_eq!(std::fs::read(pulled.join("one.txt")).unwrap(), b"first");
     assert_eq!(std::fs::read(pulled.join("two.txt")).unwrap(), b"second");
-    assert_eq!(std::fs::read(pulled.join("dir/inner.txt")).unwrap(), b"nested");
+    assert_eq!(
+        std::fs::read(pulled.join("dir/inner.txt")).unwrap(),
+        b"nested"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -208,11 +232,24 @@ fn test_transfer_denied_when_disabled() {
 
     let remote = tmp.join("remote");
     assert!(
-        !run_transfer(bin, port, "push", &[src.to_str().unwrap(), remote.to_str().unwrap()]),
+        !run_transfer(
+            bin,
+            port,
+            "push",
+            &[src.to_str().unwrap(), remote.to_str().unwrap()]
+        ),
         "push should fail when transfers are disabled"
     );
     assert!(
-        !run_transfer(bin, port, "pull", &[remote.to_str().unwrap(), tmp.join("pulled").to_str().unwrap()]),
+        !run_transfer(
+            bin,
+            port,
+            "pull",
+            &[
+                remote.to_str().unwrap(),
+                tmp.join("pulled").to_str().unwrap()
+            ]
+        ),
         "pull should fail when transfers are disabled"
     );
 
