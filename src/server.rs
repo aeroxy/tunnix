@@ -1071,6 +1071,11 @@ async fn relay_pty_connection(
 
     let mut resize_rx = resize_rx;
     let mut client_gone = false;
+    // Set when the write task's select arm resolves it: a JoinHandle polled to
+    // completion has taken its output, so awaiting it again below would panic
+    // ("JoinHandle polled after completion"). The other arms leave write_task
+    // un-polled, so those paths still abort-and-await it.
+    let mut write_task_done = false;
     let code = loop {
         tokio::select! {
             res = &mut wait_handle => break res.unwrap_or(-1),
@@ -1082,6 +1087,7 @@ async fn relay_pty_connection(
             }
             _ = &mut write_task => {
                 // Client went away (Close removed the writer sender). Kill the child.
+                write_task_done = true;
                 let _ = killer.kill();
                 client_gone = true;
                 break (&mut wait_handle).await.unwrap_or(-1);
@@ -1122,9 +1128,12 @@ async fn relay_pty_connection(
 
     // The write task ends on its own once the client closes the write channel;
     // abort it in case we're tearing down while it's parked waiting for the
-    // master to become writable.
-    write_task.abort();
-    let _ = write_task.await;
+    // master to become writable. Skip it when its own select arm already drove
+    // it to completion — re-awaiting a finished JoinHandle panics.
+    if !write_task_done {
+        write_task.abort();
+        let _ = write_task.await;
+    }
 
     // Report exit code, then close the logical connection.
     for msg in [
@@ -1539,5 +1548,75 @@ mod tests {
             Message::from_bytes(&plaintext).unwrap(),
             Message::Close { conn_id: 7 }
         ));
+    }
+
+    /// A client that sends `Close` while the exec child is still running drives
+    /// `write_task` to completion through its own `select!` arm. The post-loop
+    /// teardown must not re-await that finished `JoinHandle` — doing so panics
+    /// with "JoinHandle polled after completion" and skips the child kill and
+    /// channel cleanup.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_relay_survives_client_close_while_child_is_alive() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        // `cat` blocks reading its PTY stdin, so the child stays alive until the
+        // relay kills it — exactly the "client closed while child alive" case.
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        drop(pair.slave);
+        let master = pair.master;
+        let writer = master.take_writer().unwrap();
+
+        // Dropping the write sender closes write_rx, so write_task finishes at
+        // once and its select! arm wins while the child is still running.
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+        drop(write_tx);
+        // Keep the resize sender alive so resize_rx stays pending, as the real
+        // session (which owns it in pty_resize) does.
+        let (_resize_tx, resize_rx) = mpsc::channel::<PtySize>(4);
+        // Keep the SSE receiver alive so the terminal ExitStatus/Close sends land.
+        let (sse_tx, _sse_rx) = mpsc::channel::<Vec<u8>>(1024);
+
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }));
+        let crypto = Arc::new(Crypto::new("test-password").unwrap());
+        let shutdown = Shutdown::default();
+        let exec = Executor::graceful(shutdown.guard());
+        let guard = shutdown_guard(&exec);
+
+        // Before the fix this panicked; now it kills the child and returns.
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            relay_pty_connection(
+                1,
+                (master, writer, child),
+                write_rx,
+                resize_rx,
+                session.clone(),
+                crypto,
+                guard,
+            ),
+        )
+        .await
+        .expect("PTY relay did not tear down");
+
+        // Teardown ran to completion: the writer bookkeeping was reclaimed.
+        let session = session.lock().await;
+        assert!(session.tcp_writers.is_empty());
+        assert!(session.pty_resize.is_empty());
     }
 }
