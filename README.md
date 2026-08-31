@@ -215,9 +215,8 @@ password = "your-secret"
 server_url = "https://your-host.example.com"
 password = "your-secret"
 local_addr = "127.0.0.1:7890"
-
-[client.headers]
-# Cookie = "..."   # only needed for cookie-authenticated hosts
+# Ordered pairs preserve repeated field lines.
+headers = [["Cookie", "..."]] # only needed for cookie-authenticated hosts
 
 [logging]
 level = "info"
@@ -242,7 +241,7 @@ This applies to every subcommand, including `push` / `pull` and `remote-exec` �
 
 CLI flags always override config file values. The password can also be supplied via the `TUNNIX_PASSWORD` environment variable.
 
-Changes to `config.toml` are picked up automatically every few seconds — no restart needed. Hot-reloadable fields: `password`, `headers`, `path_prefix`, `root_redirect`, `root_html`, `health_response`. Fields that require a restart: `listen`, `local_addr`, `server_url`, `logging.level`. CLI overrides are never clobbered by file changes.
+Changes to `config.toml` are picked up automatically every few seconds — no restart needed. Hot-reloadable fields: `password`, `headers`, `server_url`, `path_prefix`, `root_redirect`, `root_html`, `health_response`. Fields that require a restart: `listen`, `local_addr`, `logging.level`. CLI overrides are never clobbered by file changes.
 
 ## Building
 
@@ -270,9 +269,8 @@ Local SOCKS5/HTTP client
         │
         ▼
   tunnix client
-  ├── proxy.rs       — TCP listener; detects protocol (0x05=SOCKS5, letter=HTTP)
-  ├── socks5.rs      — SOCKS5 handshake (RFC 1928, CONNECT only)
-  ├── http_proxy.rs  — HTTP CONNECT + plain HTTP forwarding
+  ├── proxy.rs       — Rama SOCKS5/HTTP listener, CONNECT and plain HTTP proxy
+  ├── tunnel_connector.rs — adapts Rama connections to the encrypted envelope
   ├── relay.rs       — bidirectional relay; connection ID counter
   ├── exec.rs        — remote-exec client: raw terminal + PTY stream (Unix)
   └── tunnel.rs      — HTTP/SSE tunnel to server
@@ -281,16 +279,14 @@ Local SOCKS5/HTTP client
           │  GET  /[prefix]/stream/{session}  SSE text/event-stream
           ▼
   tunnix server
-  └── server.rs      — hyper HTTP/1.1 server; session routing; prefix stripping
+  └── server.rs      — Rama HTTP server; session routing; prefix stripping
           │
           │  raw TCP
           ▼
   Target (e.g. api.example.com:443)
 ```
 
-The client auto-detects the incoming protocol by peeking the first byte:
-- `0x05` → SOCKS5
-- ASCII letter → HTTP proxy (`CONNECT` for HTTPS, method for plain HTTP)
+Rama's `Socks5PeekRouter` detects SOCKS5 without consuming its greeting and otherwise routes the connection to Rama's HTTP server. Rama handles SOCKS5 negotiation, HTTP routing, SSE framing, CONNECT upgrades, HTTP version adaptation, graceful shutdown, and hop-by-hop headers; tunnix's custom encrypted envelope remains unchanged.
 
 ## Security
 
@@ -298,6 +294,7 @@ The client auto-detects the incoming protocol by peeking the first byte:
 - ChaCha20-Poly1305 AEAD, per-message random nonce
 - No plaintext payload logging
 - Use a strong, randomly generated password — it is the only credential
+- HTTPS certificate verification is currently disabled for compatibility with existing TLS-inspecting deployments; a follow-up should make normal roots the default and require an explicit custom-CA or insecure mode.
 - **Remote exec is off by default.** `--allow-exec` (server) grants a shell to anyone with the password — effectively full RCE on the host. Leave it disabled unless you explicitly need it.
 
 ## Use with Clash / ClashX

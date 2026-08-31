@@ -3,9 +3,20 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
-use tracing::{info, warn};
+use rama::{
+    error::extra::OpaqueError,
+    http::{client::EasyHttpWebClient, HeaderMap, Request, Response},
+    layer::MapErrLayer,
+    net::client::{NoProxyEnvLayer, ProxyEnvLayer, ProxyRoutesLayer},
+    net::uri::Uri,
+    rt::Executor,
+    service::BoxService,
+    telemetry::tracing::{info, warn},
+    tls::client::{ServerVerifyMode, TlsClientConfig},
+    Layer, Service,
+};
 
-use crate::config::Config;
+use crate::config::{normalize_path_prefix, normalize_server_url, Config};
 use crate::crypto::Crypto;
 
 pub struct CliOverrides {
@@ -18,8 +29,8 @@ pub struct CliOverrides {
 
 pub struct HotServerConfig {
     pub crypto: Arc<Crypto>,
-    pub path_prefix: String,
-    pub root_redirect: Option<String>,
+    pub path_prefix: Option<Uri>,
+    pub root_redirect: Option<Uri>,
     pub root_html: Option<String>,
     pub health_body: String,
     pub allow_exec: bool,
@@ -28,26 +39,36 @@ pub struct HotServerConfig {
 
 pub struct HotClientConfig {
     pub crypto: Arc<Crypto>,
-    pub http_client: reqwest::Client,
-    pub server_base_url: String,
+    pub http_client: HttpClient,
+    pub http_headers: HeaderMap,
+    pub server_base_url: Uri,
 }
 
-pub fn build_http_client(headers: &HashMap<String, String>) -> anyhow::Result<reqwest::Client> {
-    let mut default_headers = reqwest::header::HeaderMap::new();
-    for (key, value) in headers {
-        default_headers.insert(
-            reqwest::header::HeaderName::from_bytes(key.as_bytes())?,
-            reqwest::header::HeaderValue::from_str(value)?,
-        );
-    }
-    Ok(reqwest::Client::builder()
-        .default_headers(default_headers)
-        // Intentional: deployments behind a corporate TLS-inspecting proxy
-        // (MITM CA) rely on this so the client trusts the proxy's re-signed
-        // cert. Do NOT remove without coordinating with operators using such
-        // proxies — they would otherwise fail every TLS handshake.
-        .danger_accept_invalid_certs(true)
-        .build()?)
+pub type HttpClient = BoxService<Request, Response, OpaqueError>;
+
+pub fn build_http_client(exec: Executor) -> HttpClient {
+    // Compatibility with the previous reqwest client, which used
+    // danger_accept_invalid_certs(true) for TLS-inspecting deployments.
+    // TODO: make verification the secure default and expose explicit system,
+    // custom-CA, and insecure modes instead of disabling it globally.
+    let tls = TlsClientConfig::default_http().with_server_verify(ServerVerifyMode::Disable);
+    let client = EasyHttpWebClient::connector_builder()
+        .with_default_transport_connector()
+        .with_default_dns_connector()
+        .with_tls_proxy_support_using_rustls()
+        .with_proxy_support()
+        .with_tls_support_using_rustls(tls)
+        .with_default_http_connector(exec)
+        .with_default_connection_pool()
+        .build_client();
+
+    let client = (
+        NoProxyEnvLayer::default(),
+        ProxyEnvLayer::default(),
+        ProxyRoutesLayer::new(),
+    )
+        .into_layer(client);
+    MapErrLayer::into_opaque_error().into_layer(client).boxed()
 }
 
 pub async fn config_watcher_server(
@@ -76,7 +97,10 @@ pub async fn config_watcher_server(
             }
             Err(_) => {
                 if !file_missing {
-                    warn!("Config file not accessible: {}; keeping current config", path);
+                    warn!(
+                        "Config file not accessible: {}; keeping current config",
+                        path
+                    );
                     file_missing = true;
                 }
                 continue;
@@ -133,7 +157,13 @@ pub async fn config_watcher_server(
 
         let crypto = new_crypto.unwrap_or_else(|| current.crypto.clone());
 
-        let path_prefix = sc.path_prefix.trim_end_matches('/').to_string();
+        let path_prefix = match normalize_path_prefix(sc.path_prefix.as_ref()) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                warn!(%error, "invalid path prefix; keeping current config");
+                current.path_prefix.clone()
+            }
+        };
         if path_prefix != current.path_prefix {
             changed.push("path_prefix");
         }
@@ -190,7 +220,9 @@ pub async fn config_watcher_client(
     hot: Arc<ArcSwap<HotClientConfig>>,
     reconnect_signal: Arc<tokio::sync::Notify>,
     session_id: Arc<tokio::sync::RwLock<String>>,
-    response_channels: Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<crate::tunnel::TunnelEvent>>>>,
+    response_channels: Arc<
+        tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<crate::tunnel::TunnelEvent>>>,
+    >,
     overrides: Arc<CliOverrides>,
 ) {
     let mut last_mtime = std::fs::metadata(&path)
@@ -198,7 +230,6 @@ pub async fn config_watcher_client(
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
     let mut last_password = String::new();
-    let mut last_headers: HashMap<String, String> = HashMap::new();
     let mut file_missing = false;
 
     let mut interval = tokio::time::interval(Duration::from_secs(3));
@@ -215,7 +246,10 @@ pub async fn config_watcher_client(
             }
             Err(_) => {
                 if !file_missing {
-                    warn!("Config file not accessible: {}; keeping current config", path);
+                    warn!(
+                        "Config file not accessible: {}; keeping current config",
+                        path
+                    );
                     file_missing = true;
                 }
                 continue;
@@ -272,44 +306,57 @@ pub async fn config_watcher_client(
             None
         };
 
-        let new_client = if !overrides.client_headers && cc.headers != last_headers {
-            match build_http_client(&cc.headers) {
-                Ok(c) => {
-                    changed.push("headers");
-                    needs_reconnect = true;
-                    Some(c)
-                }
-                Err(e) => {
-                    warn!("Failed to build HTTP client: {}", e);
-                    None
-                }
-            }
+        let headers_match = cc
+            .headers
+            .ordered_iter()
+            .map(|(name, value)| (name.as_original_str(), value))
+            .eq(current
+                .http_headers
+                .ordered_iter()
+                .map(|(name, value)| (name.as_original_str(), value)));
+        let new_headers = if !overrides.client_headers && !headers_match {
+            changed.push("headers");
+            needs_reconnect = true;
+            Some(cc.headers.clone())
         } else {
             None
         };
 
-        let new_server_url = cc.server_url.trim_end_matches('/').to_string();
-        if new_server_url != current.server_base_url {
-            changed.push("server_url");
-            needs_reconnect = true;
-        }
+        let new_server_url = match cc.server_url.as_ref() {
+            Some(url) => match normalize_server_url(url) {
+                Ok(url) if url != current.server_base_url => {
+                    changed.push("server_url");
+                    needs_reconnect = true;
+                    Some(url)
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    warn!("Invalid server URL: {}; keeping current config", e);
+                    None
+                }
+            },
+            None => {
+                warn!("Reloaded config has no server URL; keeping current config");
+                None
+            }
+        };
 
         if changed.is_empty() {
             continue;
         }
 
         last_password = cc.password.clone();
-        last_headers = cc.headers.clone();
 
         let crypto = new_crypto.unwrap_or_else(|| current.crypto.clone());
-        let http_client = new_client.unwrap_or_else(|| current.http_client.clone());
-        let server_base_url = if new_server_url != current.server_base_url {
-            new_server_url
-        } else {
-            current.server_base_url.clone()
-        };
+        let http_headers = new_headers.unwrap_or_else(|| current.http_headers.clone());
+        let server_base_url = new_server_url.unwrap_or_else(|| current.server_base_url.clone());
 
-        hot.store(Arc::new(HotClientConfig { crypto, http_client, server_base_url }));
+        hot.store(Arc::new(HotClientConfig {
+            crypto,
+            http_client: current.http_client.clone(),
+            http_headers,
+            server_base_url,
+        }));
         info!("Config reloaded: {}", changed.join(", "));
 
         if needs_reconnect {

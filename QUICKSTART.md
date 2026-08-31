@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.70+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- Rust 1.96+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - Access to a server (e.g., Google Cloud Shell, Codespaces, or a VPS)
 
 ## Step 1: Build
