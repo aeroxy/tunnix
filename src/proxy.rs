@@ -47,9 +47,9 @@ pub async fn run_proxy(
         .without_proxy_support()
         .with_tls_support_using_rustls(TlsClientConfig::default_http())
         .with_default_http_connector(exec.clone())
-        // Rama 0.4's pooled custom-transport path overflowed the default
-        // debug worker stack. Rama 0.5-dev contains substantial pool reuse
-        // and waiter fixes (#1141); re-test and restore pooling on upgrade.
+        // Rama 0.4's pooled custom-transport path overflowed the default debug
+        // worker stack. Rama 0.5-dev #1141 fixes separate pool correctness
+        // issues; reproduce the stack overflow there before restoring pooling.
         .without_connection_pool()
         .build_client()
         .boxed();

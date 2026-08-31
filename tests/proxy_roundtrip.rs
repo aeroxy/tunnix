@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,8 +86,9 @@ impl Drop for KillOnDrop {
 fn http_socks5_and_connect_share_the_rama_listener() {
     let target = TcpListener::bind("127.0.0.1:0").expect("bind target");
     let target_port = target.local_addr().unwrap().port();
+    let (release_target_tx, release_target_rx) = mpsc::channel();
     let target_thread = thread::spawn(move || {
-        for request_index in 0..4 {
+        for request_index in 0..5 {
             let (mut stream, _) = target.accept().expect("accept target request");
             if request_index == 3 {
                 let mut request = Vec::new();
@@ -97,6 +99,20 @@ fn http_socks5_and_connect_share_the_rama_listener() {
                 stream
                     .write_all(b"response-after-eof")
                     .expect("write response after request EOF");
+                continue;
+            }
+            if request_index == 4 {
+                // Let the upload fill the target receive window before closing
+                // only the response direction. The proxy must forward that EOF
+                // without waiting for the blocked upload drain.
+                thread::sleep(Duration::from_millis(500));
+                stream
+                    .write_all(b"response-before-input-drain")
+                    .expect("write response before input drain");
+                stream.shutdown(Shutdown::Write).unwrap();
+                release_target_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release target after client observed EOF");
                 continue;
             }
             let request = String::from_utf8(read_headers(&mut stream)).expect("utf-8 request");
@@ -230,6 +246,30 @@ fn http_socks5_and_connect_share_the_rama_listener() {
     let mut response = Vec::new();
     half_closed.read_to_end(&mut response).unwrap();
     assert_eq!(response, b"response-after-eof");
+
+    let mut target_eof = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy_port)).unwrap();
+    write!(
+        target_eof,
+        "CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\n\r\n"
+    )
+    .unwrap();
+    let connect_response = String::from_utf8(read_headers(&mut target_eof)).unwrap();
+    assert!(
+        connect_response.starts_with("HTTP/1.1 200"),
+        "{connect_response}"
+    );
+    let mut upload = target_eof.try_clone().unwrap();
+    let upload_thread = thread::spawn(move || {
+        let _ = upload.write_all(&vec![0; kib(16 * 1024)]);
+    });
+    target_eof
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut response = Vec::new();
+    target_eof.read_to_end(&mut response).unwrap();
+    assert_eq!(response, b"response-before-input-drain");
+    release_target_tx.send(()).unwrap();
+    upload_thread.join().unwrap();
 
     target_thread.join().unwrap();
     let _ = std::fs::remove_dir_all(temp);

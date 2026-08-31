@@ -681,31 +681,28 @@ async fn relay_tcp_connection(
     tokio::pin!(read);
     tokio::pin!(write);
 
-    let target_output_closed = tokio::select! {
+    let target_output_closed_first = tokio::select! {
         _ = shutdown.cancelled() => {
             debug!(conn_id, "closing target connection for shutdown");
-            false
+            None
         }
-        _ = &mut read => {
-            // Stop accepting more client bytes, then let the writer drain what
-            // was already queued before closing the target's write half.
-            session.lock().await.tcp_writers.remove(&conn_id);
-            tokio::select! {
-                _ = shutdown.cancelled() => false,
-                _ = &mut write => true,
-            }
-        }
+        _ = &mut read => Some(true),
         _ = &mut write => {
             // Client input reached EOF. Preserve TCP half-close semantics by
             // continuing to read the target's response until its EOF.
             tokio::select! {
-                _ = shutdown.cancelled() => false,
-                _ = &mut read => true,
+                _ = shutdown.cancelled() => None,
+                _ = &mut read => Some(false),
             }
         }
     };
 
-    if target_output_closed {
+    if let Some(target_output_closed_first) = target_output_closed_first {
+        if target_output_closed_first {
+            // Stop accepting new client bytes, but do not delay the client-bound
+            // Close behind a potentially blocked drain to the target.
+            session.lock().await.tcp_writers.remove(&conn_id);
+        }
         let close = Message::Close { conn_id };
         if let Ok(bytes) = close.to_bytes() {
             if let Ok(encrypted) = crypto.encrypt(&bytes) {
@@ -717,6 +714,15 @@ async fn relay_tcp_connection(
                 // teardown on the full-but-undrained bounded channel.
                 let _ =
                     tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted)).await;
+            }
+        }
+        if target_output_closed_first {
+            // Data frames from the completed read future were queued before
+            // Close. Continue draining already-accepted client input without
+            // making the client's EOF depend on the target reading it all.
+            tokio::select! {
+                _ = shutdown.cancelled() => {},
+                _ = &mut write => {},
             }
         }
     }

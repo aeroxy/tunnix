@@ -97,12 +97,14 @@ pub async fn relay<S>(
     };
 
     let close = Message::Close { conn_id };
-    let _ = tunnel.send_message(&close).await;
     if local_input_closed {
         // Close is directional on the wire: it ends client -> target input.
-        // Keep delivering target -> client data until the server sends its
-        // own Close, preserving responses from protocols that reply after EOF.
-        write.await;
+        // Keep draining concurrently with the POST so a response burst cannot
+        // fill this connection's channel and stall the shared SSE dispatcher.
+        let (close_result, _) = tokio::join!(tunnel.send_message(&close), write.as_mut());
+        let _ = close_result;
+    } else {
+        let _ = tunnel.send_message(&close).await;
     }
     tunnel.unregister_connection(conn_id).await;
 }
