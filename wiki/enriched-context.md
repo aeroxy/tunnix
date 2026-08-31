@@ -16,7 +16,9 @@ Plain HTTP proxy requests are temporarily unpooled on Rama 0.4 because the poole
 
 The client uses a typed SSE data reader that decodes encrypted base64 frames directly into bytes. [Upstream change #1140](https://github.com/plabayo/rama/pull/1140) optimizes Rama's core SSE decoder in 0.5 development, but application-specific typed decoding still avoids a temporary `String`.
 
-TCP relays preserve half-close semantics: after one input direction reaches EOF, the reverse direction remains alive until peer EOF, session reset, or graceful shutdown. There is intentionally no application-level idle timeout; imposing one would change valid long-lived TCP behavior and should only be introduced as an explicit operator policy.
+TCP relays preserve half-close semantics in both directions. Local input EOF shuts down only target input and keeps delivering the target response. Target output EOF sends a clean FIN to the local application while keeping client input registered and forwarding until the application sends its own directional `Close`. Only an actual forwarding failure switches to discarded-input cleanup, bounded to five seconds so a broken relay cannot linger indefinitely or immediately turn an already-delivered FIN into RST.
+
+SSE reconnection preserves live target writers, but the current tunnel protocol has no sequence numbers or delivery acknowledgements. A frame accepted into an old server-side SSE queue can therefore be lost if that response is replaced before the frame reaches the client; retrying a later terminal message on the new queue cannot prove continuity. Lossless connection preservation across SSE epochs requires a protocol follow-up with sequencing, acknowledgement, replay, and client-side deduplication. Until then, reconnect preservation is best-effort rather than a wire-fidelity guarantee.
 
 The README previously said "WebSocket tunnel" — that was aspirational documentation from an earlier design. The transport has always been HTTP/SSE in the actual implementation.
 

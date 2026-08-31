@@ -113,6 +113,11 @@ fn http_socks5_and_connect_share_the_rama_listener() {
                 release_target_rx
                     .recv_timeout(Duration::from_secs(5))
                     .expect("release target after client observed EOF");
+                let mut upload = Vec::new();
+                stream
+                    .read_to_end(&mut upload)
+                    .expect("read upload after response EOF");
+                assert_eq!(upload.len(), kib(16 * 1024));
                 continue;
             }
             let request = String::from_utf8(read_headers(&mut stream)).expect("utf-8 request");
@@ -260,7 +265,8 @@ fn http_socks5_and_connect_share_the_rama_listener() {
     );
     let mut upload = target_eof.try_clone().unwrap();
     let upload_thread = thread::spawn(move || {
-        let _ = upload.write_all(&vec![0; kib(16 * 1024)]);
+        upload.write_all(&vec![0; kib(16 * 1024)])?;
+        upload.shutdown(Shutdown::Write)
     });
     target_eof
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -269,7 +275,7 @@ fn http_socks5_and_connect_share_the_rama_listener() {
     target_eof.read_to_end(&mut response).unwrap();
     assert_eq!(response, b"response-before-input-drain");
     release_target_tx.send(()).unwrap();
-    upload_thread.join().unwrap();
+    upload_thread.join().unwrap().unwrap();
 
     target_thread.join().unwrap();
     let _ = std::fs::remove_dir_all(temp);

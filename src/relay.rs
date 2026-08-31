@@ -6,10 +6,12 @@ use rama::{
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 static CONN_COUNTER: AtomicU32 = AtomicU32::new(1);
+const FAILED_INPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn next_conn_id() -> u32 {
     CONN_COUNTER.fetch_add(1, Ordering::SeqCst)
@@ -27,20 +29,11 @@ pub async fn relay<S>(
 {
     let (mut tcp_read, mut tcp_write) = tokio::io::split(stream);
     let tunnel_clone = tunnel.clone();
-    let (discard_input_tx, mut discard_input_rx) = oneshot::channel();
 
     let read = async move {
         let mut buf = vec![0u8; kib(32)];
-        let mut discard_input = false;
-        'forward: loop {
-            let result = tokio::select! {
-                _ = &mut discard_input_rx => {
-                    discard_input = true;
-                    break 'forward;
-                }
-                result = tcp_read.read(&mut buf) => result,
-            };
-            match result {
+        loop {
+            match tcp_read.read(&mut buf).await {
                 Ok(0) => {
                     debug!(conn_id, "client reached EOF");
                     break;
@@ -51,32 +44,37 @@ pub async fn relay<S>(
                         conn_id,
                         data: buf[..n].to_vec(),
                     };
-                    let result = tokio::select! {
-                        _ = &mut discard_input_rx => {
-                            discard_input = true;
-                            break 'forward;
-                        }
-                        result = tunnel_clone.send_message(&msg) => result,
-                    };
-                    if let Err(e) = result {
+                    if let Err(e) = tunnel_clone.send_message(&msg).await {
                         error!(conn_id, error = %e, "tunnel send failed");
+                        // Forwarding has failed, so remaining input cannot
+                        // reach the target. Linger briefly to drain unread
+                        // kernel bytes before dropping the socket; this keeps
+                        // an already-delivered FIN from becoming an immediate
+                        // RST without retaining a broken relay indefinitely.
+                        let drain = async {
+                            loop {
+                                match tcp_read.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                            }
+                        };
+                        if tokio::time::timeout(FAILED_INPUT_DRAIN_TIMEOUT, drain)
+                            .await
+                            .is_err()
+                        {
+                            debug!(
+                                conn_id,
+                                timeout_seconds = FAILED_INPUT_DRAIN_TIMEOUT.as_secs(),
+                                "failed input linger timed out"
+                            );
+                        }
                         break;
                     }
                 }
                 Err(e) => {
                     debug!(conn_id, error = %e, "client read failed");
                     break;
-                }
-            }
-        }
-        if discard_input {
-            // The server has stopped accepting this direction after target
-            // EOF. Drain unread local bytes before dropping the socket so the
-            // clean FIN sent to the application is not converted into RST.
-            loop {
-                match tcp_read.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
                 }
             }
         }
@@ -136,12 +134,13 @@ pub async fn relay<S>(
         let (close_result, _) = tokio::join!(tunnel.send_message(&close), write.as_mut());
         let _ = close_result;
     } else if graceful_remote_close {
-        // The target has ended its output while the local application still
-        // has unread upload data. Send FIN above, then drain that input without
-        // forwarding it so dropping the socket cannot turn the FIN into RST.
-        let _ = discard_input_tx.send(());
-        let (close_result, _) = tokio::join!(tunnel.send_message(&close), read.as_mut());
-        let _ = close_result;
+        // Target -> client reached EOF, but TCP remains writable in the other
+        // direction. Stop tracking response events and keep forwarding local
+        // input until the application reaches EOF, then close that direction.
+        tunnel.unregister_connection(conn_id).await;
+        read.await;
+        let _ = tunnel.send_message(&close).await;
+        return;
     } else {
         let _ = tunnel.send_message(&close).await;
     }

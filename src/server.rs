@@ -612,7 +612,7 @@ async fn relay_tcp_connection(
             match tcp_read.read(&mut buf).await {
                 Ok(0) => {
                     debug!("[{}] TCP EOF", conn_id);
-                    break;
+                    return Ok::<(), String>(());
                 }
                 Ok(n) => {
                     debug!("[{}] TCP -> SSE {} bytes", conn_id, n);
@@ -622,11 +622,17 @@ async fn relay_tcp_connection(
                     };
                     let bytes = match msg.to_bytes() {
                         Ok(b) => b,
-                        Err(e) => { error!("[{}] Serialize: {}", conn_id, e); break; }
+                        Err(e) => {
+                            error!(conn_id, error = %e, "target data serialization failed");
+                            return Err(format!("target data serialization failed: {e}"));
+                        }
                     };
                     let encrypted = match crypto_clone.encrypt(&bytes) {
                         Ok(e) => e,
-                        Err(e) => { error!("[{}] Encrypt: {}", conn_id, e); break; }
+                        Err(e) => {
+                            error!(conn_id, error = %e, "target data encryption failed");
+                            return Err(format!("target data encryption failed: {e}"));
+                        }
                     };
 
                     // Deliver this chunk to the (possibly reconnected) SSE
@@ -651,17 +657,16 @@ async fn relay_tcp_connection(
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                     if !delivered {
-                        debug!("[{}] SSE unreachable; closing TCP relay", conn_id);
-                        break;
+                        debug!(conn_id, "SSE unreachable; closing TCP relay");
+                        return Err("target response delivery failed".to_owned());
                     }
                 }
                 Err(e) => {
-                    debug!("[{}] TCP read error: {}", conn_id, e);
-                    break;
+                    debug!(conn_id, error = %e, "target TCP read failed");
+                    return Err(format!("target read failed: {e}"));
                 }
             }
         }
-
     };
 
     let write = async move {
@@ -681,46 +686,86 @@ async fn relay_tcp_connection(
     tokio::pin!(read);
     tokio::pin!(write);
 
-    let target_output_closed_first = tokio::select! {
+    let target_read_end = tokio::select! {
         _ = shutdown.cancelled() => {
             debug!(conn_id, "closing target connection for shutdown");
+            let close = Message::Close { conn_id };
+            let _ = send_to_client_with_retry_limit(
+                conn_id,
+                &close,
+                &crypto,
+                &session,
+                1,
+            ).await;
             None
         }
-        _ = &mut read => Some(true),
+        result = &mut read => Some((true, result)),
         _ = &mut write => {
             // Client input reached EOF. Preserve TCP half-close semantics by
             // continuing to read the target's response until its EOF.
             tokio::select! {
-                _ = shutdown.cancelled() => None,
-                _ = &mut read => Some(false),
+                _ = shutdown.cancelled() => {
+                    debug!(conn_id, "closing half-closed target connection for shutdown");
+                    let close = Message::Close { conn_id };
+                    let _ = send_to_client_with_retry_limit(
+                        conn_id,
+                        &close,
+                        &crypto,
+                        &session,
+                        1,
+                    ).await;
+                    None
+                },
+                result = &mut read => Some((false, result)),
             }
         }
     };
 
-    if let Some(target_output_closed_first) = target_output_closed_first {
-        if target_output_closed_first {
-            // Stop accepting new client bytes, but do not delay the client-bound
-            // Close behind a potentially blocked drain to the target.
-            session.lock().await.tcp_writers.remove(&conn_id);
-        }
-        let close = Message::Close { conn_id };
-        if target_output_closed_first {
-            // Data frames from the completed read future were queued before
-            // Close. Deliver Close with the same reconnect-aware retry policy,
-            // while draining accepted input independently.
-            tokio::select! {
-                _ = shutdown.cancelled() => {},
-                _ = async {
-                    let _ = tokio::join!(
-                        send_to_client(conn_id, &close, &crypto, &session),
-                        write.as_mut(),
-                    );
-                } => {},
+    if let Some((target_output_closed_first, target_read_result)) = target_read_end {
+        match target_read_result {
+            Ok(()) if target_output_closed_first => {
+                // Target -> client reached EOF. Keep the writer registered so
+                // client -> target remains live until the client sends its own
+                // directional Close.
+                let close = Message::Close { conn_id };
+                tokio::select! {
+                    _ = shutdown.cancelled() => {},
+                    _ = async {
+                        let deliver_close = async {
+                            if !send_to_client(conn_id, &close, &crypto, &session).await {
+                                // No client remained through the reconnect
+                                // window, so no reverse-direction Close can
+                                // arrive to release the writer.
+                                session.lock().await.tcp_writers.remove(&conn_id);
+                            }
+                        };
+                        let _ = tokio::join!(
+                            deliver_close,
+                            write.as_mut(),
+                        );
+                    } => {},
+                }
             }
-        } else {
-            tokio::select! {
-                _ = shutdown.cancelled() => {},
-                _ = send_to_client(conn_id, &close, &crypto, &session) => {},
+            Ok(()) => {
+                let close = Message::Close { conn_id };
+                tokio::select! {
+                    _ = shutdown.cancelled() => {},
+                    _ = send_to_client(conn_id, &close, &crypto, &session) => {},
+                }
+            }
+            Err(message) => {
+                // An I/O or delivery failure is not EOF. Stop the opposite
+                // direction and report an error so the client resets locally
+                // instead of presenting a clean, potentially truncated stream.
+                session.lock().await.tcp_writers.remove(&conn_id);
+                let terminal = Message::Error {
+                    conn_id: Some(conn_id),
+                    message,
+                };
+                tokio::select! {
+                    _ = shutdown.cancelled() => {},
+                    _ = send_to_client(conn_id, &terminal, &crypto, &session) => {},
+                }
             }
         }
     }
@@ -1065,6 +1110,20 @@ async fn forward_pty_chunk(
 /// briefly across a client reconnect. Returns false if it could not be
 /// delivered. Used by TCP teardown and transfer relays.
 async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
+    let sent = send_to_client_with_retry_limit(conn_id, msg, crypto, session, 50).await;
+    if !sent {
+        error!(conn_id, "client message delivery retries exhausted");
+    }
+    sent
+}
+
+async fn send_to_client_with_retry_limit(
+    conn_id: u32,
+    msg: &Message,
+    crypto: &Crypto,
+    session: &Arc<Mutex<Session>>,
+    retry_limit: usize,
+) -> bool {
     let bytes = match msg.to_bytes() {
         Ok(b) => b,
         Err(e) => { error!(conn_id, error = %e, "client message serialization failed"); return false; }
@@ -1073,7 +1132,7 @@ async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &
         Ok(e) => e,
         Err(e) => { error!(conn_id, error = %e, "client message encryption failed"); return false; }
     };
-    for _ in 0..50 {
+    for attempt in 0..retry_limit {
         let sse_tx = {
             let sess = session.lock().await;
             sess.sse_tx.clone()
@@ -1087,9 +1146,10 @@ async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &
         {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if attempt + 1 < retry_limit {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
-    error!(conn_id, "client message delivery retries exhausted");
     false
 }
 
@@ -1293,7 +1353,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn terminal_message_retries_a_temporarily_full_sse_queue() {
         let (sse_tx, mut sse_rx) = mpsc::channel(1);
         sse_tx.send(vec![0]).await.unwrap();
@@ -1313,10 +1373,14 @@ mod tests {
             assert_eq!(sse_rx.recv().await.unwrap(), vec![0]);
             sse_rx.recv().await.unwrap()
         };
-        let (sent, encrypted) = tokio::join!(
-            send_to_client(7, &message, &crypto, &session),
-            release_queue,
-        );
+        let (sent, encrypted) = tokio::time::timeout(Duration::from_secs(35), async {
+            tokio::join!(
+                send_to_client(7, &message, &crypto, &session),
+                release_queue,
+            )
+        })
+        .await
+        .expect("terminal delivery retry stalled");
 
         assert!(sent);
         let plaintext = crypto.decrypt(&encrypted).unwrap();
