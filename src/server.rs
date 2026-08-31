@@ -675,24 +675,49 @@ async fn relay_tcp_connection(
                 break;
             }
         }
+        let _ = tcp_write.shutdown().await;
     };
 
-    tokio::select! {
-        _ = shutdown.cancelled() => debug!(conn_id, "closing target connection for shutdown"),
-        _ = read => {},
-        _ = write => {},
-    }
+    tokio::pin!(read);
+    tokio::pin!(write);
 
-    let close = Message::Close { conn_id };
-    if let Ok(bytes) = close.to_bytes() {
-        if let Ok(encrypted) = crypto.encrypt(&bytes) {
-            let sse_tx = {
-                let sess = session.lock().await;
-                sess.sse_tx.clone()
-            };
-            // Best-effort Close; bound it so a half-open client can't hang
-            // teardown on the full-but-undrained bounded channel.
-            let _ = tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted)).await;
+    let target_output_closed = tokio::select! {
+        _ = shutdown.cancelled() => {
+            debug!(conn_id, "closing target connection for shutdown");
+            false
+        }
+        _ = &mut read => {
+            // Stop accepting more client bytes, then let the writer drain what
+            // was already queued before closing the target's write half.
+            session.lock().await.tcp_writers.remove(&conn_id);
+            tokio::select! {
+                _ = shutdown.cancelled() => false,
+                _ = &mut write => true,
+            }
+        }
+        _ = &mut write => {
+            // Client input reached EOF. Preserve TCP half-close semantics by
+            // continuing to read the target's response until its EOF.
+            tokio::select! {
+                _ = shutdown.cancelled() => false,
+                _ = &mut read => true,
+            }
+        }
+    };
+
+    if target_output_closed {
+        let close = Message::Close { conn_id };
+        if let Ok(bytes) = close.to_bytes() {
+            if let Ok(encrypted) = crypto.encrypt(&bytes) {
+                let sse_tx = {
+                    let sess = session.lock().await;
+                    sess.sse_tx.clone()
+                };
+                // Best-effort Close; bound it so a half-open client can't hang
+                // teardown on the full-but-undrained bounded channel.
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted)).await;
+            }
         }
     }
     session.lock().await.tcp_writers.remove(&conn_id);

@@ -88,12 +88,21 @@ pub async fn relay<S>(
         }
     };
 
-    tokio::select! {
-        _ = read => {},
-        _ = write => {},
-    }
+    tokio::pin!(read);
+    tokio::pin!(write);
+
+    let local_input_closed = tokio::select! {
+        _ = &mut read => true,
+        _ = &mut write => false,
+    };
 
     let close = Message::Close { conn_id };
     let _ = tunnel.send_message(&close).await;
+    if local_input_closed {
+        // Close is directional on the wire: it ends client -> target input.
+        // Keep delivering target -> client data until the server sends its
+        // own Close, preserving responses from protocols that reply after EOF.
+        write.await;
+    }
     tunnel.unregister_connection(conn_id).await;
 }

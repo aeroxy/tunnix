@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -86,8 +86,19 @@ fn http_socks5_and_connect_share_the_rama_listener() {
     let target = TcpListener::bind("127.0.0.1:0").expect("bind target");
     let target_port = target.local_addr().unwrap().port();
     let target_thread = thread::spawn(move || {
-        for request_index in 0..3 {
+        for request_index in 0..4 {
             let (mut stream, _) = target.accept().expect("accept target request");
+            if request_index == 3 {
+                let mut request = Vec::new();
+                stream
+                    .read_to_end(&mut request)
+                    .expect("read half-closed request");
+                assert_eq!(request, b"request-before-eof");
+                stream
+                    .write_all(b"response-after-eof")
+                    .expect("write response after request EOF");
+                continue;
+            }
             let request = String::from_utf8(read_headers(&mut stream)).expect("utf-8 request");
             if request_index == 0 {
                 let custom_headers = request
@@ -174,7 +185,8 @@ fn http_socks5_and_connect_share_the_rama_listener() {
     assert!(read_response(http).ends_with("target:/plain"));
 
     let mut socks = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy_port)).unwrap();
-    socks.write_all(&[5, 1, 0]).unwrap();
+    // Four advertised methods catches rama-socks5's NMETHODS-as-method bug.
+    socks.write_all(&[5, 4, 0, 1, 2, 3]).unwrap();
     let mut auth = [0; 2];
     socks.read_exact(&mut auth).unwrap();
     assert_eq!(auth, [5, 0]);
@@ -201,6 +213,23 @@ fn http_socks5_and_connect_share_the_rama_listener() {
         .write_all(b"GET /connect HTTP/1.1\r\nHost: target\r\nConnection: close\r\n\r\n")
         .unwrap();
     assert!(read_response(connect).ends_with("target:/connect"));
+
+    let mut half_closed = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy_port)).unwrap();
+    write!(
+        half_closed,
+        "CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\n\r\n"
+    )
+    .unwrap();
+    let response = String::from_utf8(read_headers(&mut half_closed)).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    half_closed.write_all(b"request-before-eof").unwrap();
+    half_closed.shutdown(Shutdown::Write).unwrap();
+    half_closed
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut response = Vec::new();
+    half_closed.read_to_end(&mut response).unwrap();
+    assert_eq!(response, b"response-after-eof");
 
     target_thread.join().unwrap();
     let _ = std::fs::remove_dir_all(temp);

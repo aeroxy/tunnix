@@ -12,6 +12,10 @@ HTTP/2 is a deliberate capability expansion in this migration. The old server ex
 
 The control-plane URL intentionally accepts both `http://` and `https://`: direct and loopback deployments can reach tunnix's plaintext server, while public deployments normally use HTTPS at Cloud Shell or a reverse proxy that terminates TLS. This is independent of the proxied target protocol—the local SOCKS5/HTTP listener can carry arbitrary TCP, including end-to-end target TLS, inside the encrypted tunnix envelope.
 
+Plain HTTP proxy requests are temporarily unpooled on Rama 0.4 because the pooled custom-transport stack overflowed Tokio's default debug worker stack. Rama 0.5 development includes the pool reuse and waiter correctness work from [upstream change #1141](https://github.com/plabayo/rama/pull/1141); re-enable and load-test pooling when upgrading rather than carrying a custom 0.4 pool stack.
+
+The client uses a typed SSE data reader that decodes encrypted base64 frames directly into bytes. [Upstream change #1140](https://github.com/plabayo/rama/pull/1140) optimizes Rama's core SSE decoder in 0.5 development, but application-specific typed decoding still avoids a temporary `String`.
+
 The README previously said "WebSocket tunnel" — that was aspirational documentation from an earlier design. The transport has always been HTTP/SSE in the actual implementation.
 
 ---

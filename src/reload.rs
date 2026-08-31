@@ -5,7 +5,10 @@ use std::time::{Duration, SystemTime};
 use arc_swap::ArcSwap;
 use rama::{
     error::extra::OpaqueError,
-    http::{client::EasyHttpWebClient, HeaderMap, Request, Response},
+    http::{
+        client::{EasyHttpWebClient, HttpPooledConnectorConfig},
+        HeaderMap, Request, Response,
+    },
     layer::MapErrLayer,
     net::client::{NoProxyEnvLayer, ProxyEnvLayer, ProxyRoutesLayer},
     net::uri::Uri,
@@ -46,6 +49,9 @@ pub struct HotClientConfig {
 
 pub type HttpClient = BoxService<Request, Response, OpaqueError>;
 
+const CONTROL_PLANE_POOL_MAX_CONNECTIONS: usize = 1024;
+const CONTROL_PLANE_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn build_http_client(exec: Executor) -> HttpClient {
     // Compatibility with the previous reqwest client, which used
     // danger_accept_invalid_certs(true) for TLS-inspecting deployments.
@@ -59,7 +65,17 @@ pub fn build_http_client(exec: Executor) -> HttpClient {
         .with_proxy_support()
         .with_tls_support_using_rustls(tls)
         .with_default_http_connector(exec)
-        .with_default_connection_pool()
+        // max_total counts active plus idle connections; idle entries are
+        // evicted first, but the default of 50 can still block when all 50 are
+        // active (the long-lived HTTP/1 SSE response occupies one). Keep the
+        // wait within the tunnel's reconnect horizon. Rama 0.5-dev #1141
+        // improves pool reuse and waiter wakeups further.
+        .try_with_connection_pool(HttpPooledConnectorConfig {
+            max_total: CONTROL_PLANE_POOL_MAX_CONNECTIONS,
+            wait_for_pool_timeout: Some(CONTROL_PLANE_POOL_WAIT_TIMEOUT),
+            ..Default::default()
+        })
+        .expect("static HTTP pool configuration is valid")
         .build_client();
 
     let client = (

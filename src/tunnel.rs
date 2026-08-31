@@ -6,10 +6,12 @@ use arc_swap::ArcSwap;
 use base64ct::{Base64, Encoding};
 use rama::{
     bytes::Bytes,
+    error::BoxError,
     futures::{FutureExt, StreamExt},
     http::{
         body::util::BodyExt,
         service::client::{HttpClientExt, RequestBuilder},
+        sse::{EventDataLineReader, EventDataRead},
         BodyExtractExt, HeaderMap, Response,
     },
     net::uri::Uri,
@@ -40,6 +42,45 @@ pub enum TunnelEvent {
     Error(String),
     /// Remote process exited with this code (remote exec).
     Exit(i32),
+}
+
+#[derive(Debug)]
+enum EncryptedSseData {
+    Frame(Vec<u8>),
+    Invalid(String),
+}
+
+#[derive(Debug, Default)]
+struct EncryptedSseDataReader {
+    data: Option<EncryptedSseData>,
+}
+
+impl EventDataRead for EncryptedSseData {
+    type Reader = EncryptedSseDataReader;
+
+    fn line_reader() -> Self::Reader {
+        EncryptedSseDataReader::default()
+    }
+}
+
+impl EventDataLineReader for EncryptedSseDataReader {
+    type Data = EncryptedSseData;
+
+    fn read_line(&mut self, line: &str) -> Result<(), BoxError> {
+        self.data = Some(if self.data.is_some() {
+            EncryptedSseData::Invalid("encrypted SSE event has multiple data lines".to_owned())
+        } else {
+            match Base64::decode_vec(line.trim()) {
+                Ok(data) => EncryptedSseData::Frame(data),
+                Err(error) => EncryptedSseData::Invalid(error.to_string()),
+            }
+        });
+        Ok(())
+    }
+
+    fn data(&mut self, _event: Option<&str>) -> Result<Option<Self::Data>, BoxError> {
+        Ok(self.data.take())
+    }
 }
 
 /// Tunnel handles communication with the server via SSE + HTTP POST
@@ -190,7 +231,10 @@ impl Tunnel {
         }
         drop(current_sid);
 
-        let mut stream = resp.into_body().into_string_data_event_stream();
+        // Rama 0.5-dev #1140 makes the core SSE decoder substantially faster;
+        // this typed reader also avoids materializing each base64 payload as a
+        // temporary String on Rama 0.4.
+        let mut stream = resp.into_body().into_event_stream::<EncryptedSseData>();
         // On the initial connect, signal readiness only AFTER the first
         // `data:` frame is processed: a new session's first data frame is
         // `Reset` (which clears pending channels), and handling it before
@@ -218,15 +262,17 @@ impl Tunnel {
                     };
 
                     if let Some(data) = event.into_data() {
-                        match Base64::decode_vec(data.trim()) {
-                            Ok(encrypted) => {
+                        match data {
+                            EncryptedSseData::Frame(encrypted) => {
                                 self.handle_sse_message(&encrypted).await;
                                 if !signaled_ready {
                                     self.sse_ready.notify_waiters();
                                     signaled_ready = true;
                                 }
                             }
-                            Err(e) => warn!(error = %e, "SSE payload base64 decode failed"),
+                            EncryptedSseData::Invalid(error) => {
+                                warn!(%error, "SSE payload base64 decode failed")
+                            }
                         }
                     } else if is_reconnect && !signaled_ready {
                         // Rama exposes keepalive comments as data-less events.
@@ -495,6 +541,31 @@ mod tests {
             endpoint.to_string(),
             "https://example.com/tunnix/stream/id%2Fwith%20space"
         );
+    }
+
+    #[test]
+    fn encrypted_sse_data_decodes_directly_into_bytes() {
+        let encrypted = b"binary tunnel frame";
+        let encoded = Base64::encode_string(encrypted);
+        let mut reader = EncryptedSseData::line_reader();
+        reader.read_line(&encoded).unwrap();
+
+        match reader.data(None).unwrap().unwrap() {
+            EncryptedSseData::Frame(frame) => assert_eq!(frame, encrypted),
+            EncryptedSseData::Invalid(error) => panic!("unexpected decode failure: {error}"),
+        }
+    }
+
+    #[test]
+    fn encrypted_sse_data_rejects_multiple_data_lines() {
+        let mut reader = EncryptedSseData::line_reader();
+        reader.read_line("YQ==").unwrap();
+        reader.read_line("Yg==").unwrap();
+
+        assert!(matches!(
+            reader.data(None).unwrap(),
+            Some(EncryptedSseData::Invalid(_))
+        ));
     }
 
     #[tokio::test]

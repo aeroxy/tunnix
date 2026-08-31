@@ -15,12 +15,10 @@ use rama::{
         service::web::response::IntoResponse,
         Request, StatusCode,
     },
+    io::peek::PeekRouter,
     layer::ConsumeErrLayer,
     net::{address::SocketAddress, proxy::IoForwardService},
-    proxy::socks5::{
-        server::{Connector as Socks5Connector, Socks5PeekRouter},
-        Socks5Acceptor,
-    },
+    proxy::socks5::{server::Connector as Socks5Connector, Socks5Acceptor},
     rt::Executor,
     service::service_fn,
     tcp::server::TcpListener,
@@ -49,6 +47,9 @@ pub async fn run_proxy(
         .without_proxy_support()
         .with_tls_support_using_rustls(TlsClientConfig::default_http())
         .with_default_http_connector(exec.clone())
+        // Rama 0.4's pooled custom-transport path overflowed the default
+        // debug worker stack. Rama 0.5-dev contains substantial pool reuse
+        // and waiter fixes (#1141); re-test and restore pooling on upgrade.
         .without_connection_pool()
         .build_client()
         .boxed();
@@ -83,7 +84,11 @@ pub async fn run_proxy(
         Socks5Connector::new(connector, IoForwardService::new(exec.clone()))
             .with_hide_local_address(true),
     );
-    let proxy = Socks5PeekRouter::new(socks).with_fallback(http);
+    // Socks5PeekRouter in Rama 0.4 (and current 0.5-dev) interprets the
+    // greeting's NMETHODS count as a method ID and rejects valid counts such
+    // as four. Match the protocol version with Rama's generic replaying router
+    // until the specialized router validates NMETHODS as a count.
+    let proxy = PeekRouter::from_prefix(b"\x05", socks).with_fallback(http);
 
     info!(
         %listen_addr,
