@@ -596,6 +596,9 @@ async fn relay_tcp_connection(
     let session_clone = session.clone();
     let read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 32768];
+        // Set once a delivery has exhausted its retries: the client is then
+        // known unreachable, so teardown shouldn't spend another full budget.
+        let mut client_gone = false;
         loop {
             match tcp_read.read(&mut buf).await {
                 Ok(0) => {
@@ -608,38 +611,15 @@ async fn relay_tcp_connection(
                         conn_id,
                         data: buf[..n].to_vec(),
                     };
-                    let bytes = match msg.to_bytes() {
-                        Ok(b) => b,
-                        Err(e) => { error!("[{}] Serialize: {}", conn_id, e); break; }
-                    };
-                    let encrypted = match crypto_clone.encrypt(&bytes) {
-                        Ok(e) => e,
-                        Err(e) => { error!("[{}] Encrypt: {}", conn_id, e); break; }
-                    };
-
-                    // Deliver this chunk to the (possibly reconnected) SSE
-                    // client, retrying across a reconnect. Never drop it: a gap
-                    // would corrupt the proxied TCP byte stream. Each send is
-                    // timeout-bounded so a half-open client (channel full but
-                    // undrained) can't park us forever; if it stays unreachable,
-                    // close the relay cleanly rather than skip bytes.
-                    let mut delivered = false;
-                    for _ in 0..50 {
-                        let sse_tx = {
-                            let sess = session_clone.lock().await;
-                            sess.sse_tx.clone()
-                        };
-                        if tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted.clone()))
-                            .await
-                            .is_ok_and(|r| r.is_ok())
-                        {
-                            delivered = true;
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    if !delivered {
+                    // Never drop a chunk: a gap would corrupt the proxied TCP
+                    // byte stream. send_to_client retries across a client
+                    // reconnect and bounds each attempt, so a half-open client
+                    // (channel full but undrained) can't park us forever. If it
+                    // stays unreachable, close the relay cleanly rather than
+                    // skip bytes.
+                    if !send_to_client(conn_id, &msg, &crypto_clone, &session_clone).await {
                         debug!("[{}] SSE unreachable; closing TCP relay", conn_id);
+                        client_gone = true;
                         break;
                     }
                 }
@@ -650,17 +630,11 @@ async fn relay_tcp_connection(
             }
         }
 
-        let close = Message::Close { conn_id };
-        if let Ok(bytes) = close.to_bytes() {
-            if let Ok(encrypted) = crypto_clone.encrypt(&bytes) {
-                let sse_tx = {
-                    let sess = session_clone.lock().await;
-                    sess.sse_tx.clone()
-                };
-                // Best-effort Close; bound it so a half-open client can't hang
-                // teardown on the full-but-undrained bounded channel.
-                let _ = tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted)).await;
-            }
+        // The client's relay ends its response direction on this Close, so it
+        // has to arrive: retry across a reconnect instead of making a single
+        // attempt that a momentarily-full queue would defeat.
+        if !client_gone {
+            let _ = send_to_client(conn_id, &Message::Close { conn_id }, &crypto_clone, &session_clone).await;
         }
         let mut sess = session_clone.lock().await;
         sess.tcp_writers.remove(&conn_id);
@@ -742,23 +716,19 @@ async fn relay_pty_connection(
         Ok(pair) => pair,
         Err(e) => {
             error!("[{}] PTY async setup failed: {}", conn_id, e);
-            let sse_tx = {
+            {
                 let mut sess = session.lock().await;
                 sess.tcp_writers.remove(&conn_id);
                 sess.pty_resize.remove(&conn_id);
-                sess.sse_tx.clone()
-            };
+            }
+            // Terminal Error: without it the client waits on a PTY that will
+            // never produce output, so retry across a reconnect rather than
+            // losing it to a momentarily-full queue.
             let msg = Message::Error {
                 conn_id: Some(conn_id),
                 message: format!("PTY setup failed: {}", e),
             };
-            if let Ok(bytes) = msg.to_bytes() {
-                if let Ok(encrypted) = crypto.encrypt(&bytes) {
-                    // Best-effort error report; bound it so a half-open client
-                    // can't hang on the full-but-undrained bounded channel.
-                    let _ = tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted)).await;
-                }
-            }
+            let _ = send_to_client(conn_id, &msg, &crypto, &session).await;
             return;
         }
     };
@@ -1011,15 +981,18 @@ async fn forward_pty_chunk(
 
 /// Encrypt `msg` and push it to the (possibly-reconnected) SSE sender, retrying
 /// briefly across a client reconnect. Returns false if it could not be
-/// delivered. Cross-platform sibling of `forward_pty_chunk`, used by transfers.
+/// delivered. Cross-platform sibling of `forward_pty_chunk`; used by TCP
+/// relays, PTY teardown and transfers. Terminal messages (`Close`, `Error`,
+/// `ExitStatus`) must go through here: a single send loses them whenever the
+/// client's queue is momentarily full or its SSE stream is being replaced.
 async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
     let bytes = match msg.to_bytes() {
         Ok(b) => b,
-        Err(e) => { error!("[{}] transfer serialize: {}", conn_id, e); return false; }
+        Err(e) => { error!("[{}] serialize: {}", conn_id, e); return false; }
     };
     let encrypted = match crypto.encrypt(&bytes) {
         Ok(e) => e,
-        Err(e) => { error!("[{}] transfer encrypt: {}", conn_id, e); return false; }
+        Err(e) => { error!("[{}] encrypt: {}", conn_id, e); return false; }
     };
     for _ in 0..50 {
         let sse_tx = {
@@ -1164,6 +1137,135 @@ async fn relay_push(
                 &session,
             )
             .await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A terminal `Close` must survive an SSE queue that is momentarily full.
+    /// The relay used to make a single 500ms attempt and give up, so a client
+    /// that stalled (or was mid-reconnect) never learned the target closed and
+    /// its relay was left waiting forever.
+    #[tokio::test]
+    async fn terminal_close_survives_full_sse_queue() {
+        const CONN_ID: u32 = 42;
+
+        // Target that accepts and immediately closes: the relay's read half
+        // sees EOF straight away and heads for the terminal Close.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = target.accept().await {
+                drop(sock);
+            }
+        });
+
+        let stream = TcpStream::connect(target_addr).await.unwrap();
+        let (tcp_read, tcp_write) = stream.into_split();
+
+        // Capacity-1 SSE channel, pre-filled so the queue is full and undrained.
+        let (sse_tx, mut sse_rx) = mpsc::channel::<Vec<u8>>(1);
+        sse_tx.send(b"already queued".to_vec()).await.unwrap();
+
+        let crypto = Arc::new(Crypto::new("test-password").unwrap());
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }));
+
+        // Keep the writer alive so only the read half drives teardown.
+        let (_write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
+
+        tokio::spawn(relay_tcp_connection(
+            CONN_ID,
+            "127.0.0.1",
+            target_addr.port(),
+            tcp_read,
+            tcp_write,
+            write_rx,
+            session.clone(),
+            crypto.clone(),
+        ));
+
+        // Stay full well past the old 500ms single-shot budget, then drain.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(sse_rx.recv().await.unwrap(), b"already queued".to_vec());
+
+        let queued = tokio::time::timeout(Duration::from_secs(10), sse_rx.recv())
+            .await
+            .expect("terminal Close was dropped instead of retried")
+            .expect("SSE channel closed before the Close arrived");
+
+        let decrypted = crypto.decrypt(&queued).unwrap();
+        match Message::from_bytes(&decrypted).unwrap() {
+            Message::Close { conn_id } => assert_eq!(conn_id, CONN_ID),
+            other => panic!("expected Close, got {:?}", other),
+        }
+    }
+
+    /// A terminal `Close` must follow the client across an SSE reconnect. The
+    /// relay used to snapshot `sse_tx` once, so a Close racing a reconnect went
+    /// into the replaced channel and was never seen on the live one.
+    #[tokio::test]
+    async fn terminal_close_follows_replaced_sse_channel() {
+        const CONN_ID: u32 = 43;
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = target.accept().await {
+                drop(sock);
+            }
+        });
+
+        let stream = TcpStream::connect(target_addr).await.unwrap();
+        let (tcp_read, tcp_write) = stream.into_split();
+
+        // The "old" stream: full and undrained, as a stalled client leaves it.
+        let (old_tx, _old_rx) = mpsc::channel::<Vec<u8>>(1);
+        old_tx.send(b"stale".to_vec()).await.unwrap();
+
+        let crypto = Arc::new(Crypto::new("test-password").unwrap());
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx: old_tx,
+        }));
+
+        let (_write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
+
+        tokio::spawn(relay_tcp_connection(
+            CONN_ID,
+            "127.0.0.1",
+            target_addr.port(),
+            tcp_read,
+            tcp_write,
+            write_rx,
+            session.clone(),
+            crypto.clone(),
+        ));
+
+        // Client reconnects: handle_stream swaps in a fresh channel while the
+        // relay is still trying to deliver its Close to the old one.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let (new_tx, mut new_rx) = mpsc::channel::<Vec<u8>>(16);
+        session.lock().await.sse_tx = new_tx;
+
+        let queued = tokio::time::timeout(Duration::from_secs(10), new_rx.recv())
+            .await
+            .expect("terminal Close never reached the reconnected stream")
+            .expect("SSE channel closed before the Close arrived");
+
+        let decrypted = crypto.decrypt(&queued).unwrap();
+        match Message::from_bytes(&decrypted).unwrap() {
+            Message::Close { conn_id } => assert_eq!(conn_id, CONN_ID),
+            other => panic!("expected Close, got {:?}", other),
         }
     }
 }
