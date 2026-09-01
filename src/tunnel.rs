@@ -26,9 +26,16 @@ const CONN_CHANNEL_CAPACITY: usize = 256;
 /// How long a single event may wait for one connection's consumer before that
 /// connection is declared wedged and dropped. All connections share one
 /// dispatch loop, so an unbounded wait here starves every other connection on
-/// the tunnel. Generous: a consumer making any progress at all drains a
-/// 256-slot queue well inside this.
-const DISPATCH_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// the tunnel.
+///
+/// Must stay well under the server's per-message delivery budget in
+/// `send_to_client` (50 attempts x (500ms + 100ms) ~= 30s). Dispatch runs
+/// inline in the SSE read loop, so this is also how long the client can go
+/// without reading the SSE socket at all: at the same magnitude as that budget,
+/// one stalled consumer would let the server exhaust its retries on unrelated
+/// healthy connections and tear them down as unreachable. 5s is still ~20x what
+/// a draining 256-slot queue needs.
+const DISPATCH_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Events received from server via SSE
 #[derive(Debug)]
@@ -428,13 +435,13 @@ impl Tunnel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Build a Tunnel without a live server. handle_sse_message only touches
     /// `hot.crypto` (to decrypt) and `response_channels` (to dispatch), so the
     /// http_client / server_base_url are placeholders.
-    fn test_tunnel(password: &str) -> Tunnel {
+    pub(crate) fn test_tunnel(password: &str) -> Tunnel {
         let hot = HotClientConfig {
             crypto: Arc::new(Crypto::new(password).unwrap()),
             http_client: reqwest::Client::new(),

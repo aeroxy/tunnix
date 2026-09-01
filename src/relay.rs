@@ -28,6 +28,13 @@ pub async fn relay(
     // Raised by the write half when the connection has failed. The read half
     // has to stop cooperatively rather than being aborted: aborting would drop
     // its socket half, and both halves are needed to abort the connection.
+    //
+    // Only failures raise it. After a clean Close the read half deliberately
+    // stays open: the target closing its output says nothing about the app's
+    // upload, which the server still accepts, so this relay ends when the app
+    // closes its own side. An app that holds a half-closed connection open
+    // forever keeps its conn_id registered - correct for TCP, and bounded in
+    // practice by the app being a local process rather than a remote peer.
     let failed = Arc::new(Notify::new());
     let failed_read = failed.clone();
 
@@ -83,8 +90,11 @@ pub async fn relay(
 
     let failed_notify = failed;
     let write_task = tokio::spawn(async move {
-        // Whether this connection ended in a failure. A truncated stream must
-        // not be handed to the app as a clean end-of-stream.
+        // A clean end-of-stream is only ever earned by an explicit terminal
+        // event. Anything else that ends this loop leaves the response
+        // truncated, and handing that to the app as a successful EOF is the
+        // silent corruption this relay exists to avoid.
+        let mut terminal_seen = false;
         let mut failed = false;
         while let Some(event) = event_rx.recv().await {
             match event {
@@ -95,29 +105,43 @@ pub async fn relay(
                     debug!("[{}] tunnel -> client {} bytes", conn_id, data.len());
                     if let Err(e) = tcp_write.write_all(&data).await {
                         error!("[{}] client write error: {}", conn_id, e);
+                        failed = true;
                         break;
                     }
                 }
                 TunnelEvent::Close => {
                     debug!("[{}] tunnel closed", conn_id);
+                    terminal_seen = true;
                     // Everything arrived: FIN, so the app reads a clean EOF.
                     let _ = tcp_write.shutdown().await;
                     break;
                 }
                 TunnelEvent::Error(msg) => {
                     debug!("[{}] tunnel error: {}", conn_id, msg);
+                    terminal_seen = true;
                     failed = true;
-                    // Release the read half so the connection can be aborted:
-                    // the app is waiting on a response that will never arrive,
-                    // so it will not close its side on its own.
-                    failed_notify.notify_one();
                     break;
                 }
                 TunnelEvent::Exit(_) => {
                     // Only meaningful for remote exec; a TCP relay never sees it.
+                    terminal_seen = true;
                     break;
                 }
             }
+        }
+
+        // The channel was dropped with no terminal event: the server session
+        // was reset, or the dispatcher dropped this connection as stalled.
+        // Either way the response stopped mid-stream.
+        if !terminal_seen {
+            debug!("[{}] dispatch channel dropped mid-stream", conn_id);
+            failed = true;
+        }
+        if failed {
+            // Release the read half so the connection can be aborted: the app
+            // is waiting on a response that will never arrive, so it will not
+            // close its side on its own.
+            failed_notify.notify_one();
         }
         (tcp_write, failed)
     });
@@ -158,5 +182,58 @@ pub async fn relay(
             }
         }
         Err(e) => debug!("[{}] could not reunite socket halves: {}", conn_id, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tunnel::tests::test_tunnel;
+    use std::io::Read as _;
+    use std::net::TcpListener as StdListener;
+
+    /// The dispatch channel can be dropped without any terminal event: a server
+    /// session Reset clears every channel, and the SSE dispatcher drops a
+    /// connection it considers stalled. The response is truncated either way,
+    /// so the app must not be handed a clean end-of-stream.
+    #[tokio::test]
+    async fn a_dropped_dispatch_channel_is_not_a_clean_eof() {
+        const CONN_ID: u32 = 5;
+
+        // Stand-in for the proxied app, on a blocking socket so we can assert
+        // on exactly what a real client's read would see.
+        let listener = StdListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            let result = sock.read_to_end(&mut got);
+            (result.is_err(), got)
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let tunnel = Arc::new(test_tunnel("pw"));
+        let (event_tx, event_rx) = mpsc::channel(8);
+
+        let relay = tokio::spawn(relay(stream, CONN_ID, tunnel, event_rx));
+
+        // Part of a response arrives, then the channel goes away mid-stream
+        // with no Close and no Error - exactly what Reset and the stall path do.
+        event_tx.send(TunnelEvent::Data(b"partial".to_vec())).await.unwrap();
+        drop(event_tx);
+
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("relay did not finish")
+            .expect("relay panicked");
+
+        let (errored, got) = tokio::task::spawn_blocking(move || app.join().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            errored,
+            "truncated response was handed to the app as a clean EOF after {} byte(s)",
+            got.len()
+        );
     }
 }

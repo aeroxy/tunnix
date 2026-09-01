@@ -601,8 +601,24 @@ async fn relay_tcp_connection(
         let mut client_gone = false;
         // Set when the target itself failed, as opposed to closing cleanly.
         let mut read_failure: Option<String> = None;
+        // A silent target gives this task nothing to react to, so a vanished
+        // client would otherwise leave it blocked on read() forever, holding
+        // the target socket. The delivery retries below only notice a dead
+        // client when a chunk actually arrives. Pinned once: the counter resets
+        // itself whenever the stream is live.
+        let sse_dead = await_sse_dead(session_clone.clone());
+        tokio::pin!(sse_dead);
         loop {
-            match tcp_read.read(&mut buf).await {
+            let read = tokio::select! {
+                // Cancel-safe: no bytes are consumed if the other branch wins.
+                result = tcp_read.read(&mut buf) => result,
+                _ = &mut sse_dead => {
+                    debug!("[{}] SSE closed continuously; abandoning target read", conn_id);
+                    client_gone = true;
+                    break;
+                }
+            };
+            match read {
                 Ok(0) => {
                     debug!("[{}] TCP EOF", conn_id);
                     break;
@@ -671,13 +687,13 @@ async fn relay_tcp_connection(
 
     let session_watch = session.clone();
     let write_task = tokio::spawn(async move {
+        // The writer now outlives target-output EOF, so nothing else would wake
+        // this task if the client vanished without sending Close. Bound the
+        // wait on the client the same way the PTY relay does. Pinned once, like
+        // the PTY relay: the counter resets itself whenever the stream is live.
+        let sse_dead = await_sse_dead(session_watch.clone());
+        tokio::pin!(sse_dead);
         loop {
-            // The writer now outlives target-output EOF, so nothing else would
-            // wake this task if the client vanished without sending Close.
-            // Bound the wait on the client the same way the PTY relay does.
-            let sse_dead = await_sse_dead(session_watch.clone());
-            tokio::pin!(sse_dead);
-
             let data = tokio::select! {
                 received = write_rx.recv() => match received {
                     Some(data) => data,
@@ -694,6 +710,17 @@ async fn relay_tcp_connection(
             debug!("[{}] Client -> TCP {} bytes", conn_id, data.len());
             if let Err(e) = tcp_write.write_all(&data).await {
                 error!("[{}] TCP write error: {}", conn_id, e);
+                // The upload direction is broken. Release the writer now rather
+                // than at teardown: until it goes, handle_send keeps accepting
+                // client bytes into a channel nobody drains and answering 200,
+                // so the client uploads into nothing. Then tell it, so a failed
+                // upload is visible instead of silently discarded.
+                session_watch.lock().await.tcp_writers.remove(&conn_id);
+                let msg = Message::Error {
+                    conn_id: Some(conn_id),
+                    message: format!("target write failed: {}", e),
+                };
+                let _ = send_to_client(conn_id, &msg, &crypto, &session_watch).await;
                 break;
             }
         }
@@ -1053,6 +1080,12 @@ async fn await_sse_dead(session: Arc<Mutex<Session>>) {
 /// relays, PTY teardown and transfers. Terminal messages (`Close`, `Error`,
 /// `ExitStatus`) must go through here: a single send loses them whenever the
 /// client's queue is momentarily full or its SSE stream is being replaced.
+///
+/// The budget here (50 x (500ms + 100ms) ~= 30s) is what declares a client
+/// unreachable, so it must stay well above the client's `DISPATCH_STALL_TIMEOUT`
+/// in tunnel.rs. That timeout is how long one stalled consumer can keep the
+/// client from reading the SSE socket; if the two were the same magnitude, that
+/// stall alone would exhaust this budget and tear down healthy connections.
 async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
     let bytes = match msg.to_bytes() {
         Ok(b) => b,
@@ -1333,6 +1366,63 @@ mod tests {
             !session.lock().await.tcp_writers.contains_key(&CONN_ID),
             "writer should have been cleaned up after teardown"
         );
+    }
+
+    /// The same teardown bound, but with an idle target: it never sends and
+    /// never closes, so the read side has nothing to react to and the delivery
+    /// retries never run. Without a watchdog there the task blocks on read()
+    /// forever, leaking the task, the socket and the session entry.
+    #[tokio::test(start_paused = true)]
+    async fn read_side_gives_up_when_the_client_vanishes() {
+        const CONN_ID: u32 = 45;
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        // Accept and hold: silent, but very much open.
+        let held = tokio::spawn(async move {
+            let accepted = target.accept().await;
+            std::future::pending::<()>().await;
+            drop(accepted);
+        });
+
+        let stream = TcpStream::connect(target_addr).await.unwrap();
+        let (tcp_read, tcp_write) = stream.into_split();
+
+        let (sse_tx, sse_rx) = mpsc::channel::<Vec<u8>>(16);
+        drop(sse_rx);
+
+        let crypto = Arc::new(Crypto::new("test-password").unwrap());
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }));
+
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
+        session.lock().await.tcp_writers.insert(CONN_ID, write_tx);
+
+        let relay = tokio::spawn(relay_tcp_connection(
+            CONN_ID,
+            "127.0.0.1",
+            target_addr.port(),
+            tcp_read,
+            tcp_write,
+            write_rx,
+            session.clone(),
+            crypto,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(600), relay)
+            .await
+            .expect("relay never finished: the read side blocked on an idle target")
+            .expect("relay task panicked");
+
+        assert!(
+            !session.lock().await.tcp_writers.contains_key(&CONN_ID),
+            "writer should have been cleaned up after teardown"
+        );
+        held.abort();
     }
 
     /// A terminal `Close` must follow the client across an SSE reconnect. The
