@@ -49,9 +49,13 @@ pub async fn relay(
                 }
             }
         }
+        // Tell the server we are done sending. It drops the target's write
+        // half, so the target sees a real FIN — the half-close signal some
+        // protocols need to start replying. Deliberately *not* unregistering
+        // the conn_id here: the target may still be streaming a response, and
+        // dropping the dispatch channel now would discard it.
         let close_msg = Message::Close { conn_id };
         let _ = tunnel_clone.send_message(&close_msg).await;
-        tunnel_clone.unregister_connection(conn_id).await;
     });
 
     let write_task = tokio::spawn(async move {
@@ -83,8 +87,12 @@ pub async fn relay(
         }
     });
 
-    tokio::select! {
-        _ = read_task => {},
-        _ = write_task => {},
-    }
+    // Both directions run to completion independently: an upload that finishes
+    // must not cut off a response still in flight, and a target that stops
+    // replying must not cut off an upload still in progress. The read half ends
+    // on client EOF; the write half ends when the server reports the target
+    // closed (Close/Error), the session is reset, or the client socket dies.
+    let (_, _) = tokio::join!(read_task, write_task);
+
+    tunnel.unregister_connection(conn_id).await;
 }
