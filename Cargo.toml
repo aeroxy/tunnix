@@ -73,3 +73,8 @@ shlex = "1.3"
 libc = "0.2"
 portable-pty = "0.9"
 nix = { version = "0.29", features = ["fs", "term"] }
+
+[dev-dependencies]
+# `#[tokio::test(start_paused = true)]` lets timeout-driven tests run instantly.
+# Dev-only so the test clock never ships in a release build.
+tokio = { version = "1.40", features = ["full", "test-util"] }
