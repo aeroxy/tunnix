@@ -20,6 +20,15 @@ const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// that long under network congestion, and this also covers first-frame
 /// processing before sse_ready fires.
 const RECONNECT_WAIT: Duration = Duration::from_secs(20);
+/// Per-connection event queue depth. Deep enough that a merely slow local app
+/// keeps draining without stalling dispatch.
+const CONN_CHANNEL_CAPACITY: usize = 256;
+/// How long a single event may wait for one connection's consumer before that
+/// connection is declared wedged and dropped. All connections share one
+/// dispatch loop, so an unbounded wait here starves every other connection on
+/// the tunnel. Generous: a consumer making any progress at all drains a
+/// 256-slot queue well inside this.
+const DISPATCH_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Events received from server via SSE
 #[derive(Debug)]
@@ -263,48 +272,21 @@ impl Tunnel {
         match message {
             Message::Data { conn_id, data } => {
                 debug!("[{}] SSE data {} bytes", conn_id, data.len());
-                // Clone the sender out of the guard before awaiting send().
-                // Holding the mutex across `tx.send().await` lets one slow
-                // consumer (full channel) stall dispatch for every connection.
-                let tx = {
-                    let channels = self.response_channels.lock().await;
-                    channels.get(&conn_id).cloned()
-                };
-                if let Some(tx) = tx {
-                    let _ = tx.send(TunnelEvent::Data(data)).await;
-                }
+                self.dispatch_event(conn_id, TunnelEvent::Data(data)).await;
             }
             Message::Close { conn_id } => {
                 debug!("[{}] SSE close", conn_id);
-                let tx = {
-                    let channels = self.response_channels.lock().await;
-                    channels.get(&conn_id).cloned()
-                };
-                if let Some(tx) = tx {
-                    let _ = tx.send(TunnelEvent::Close).await;
-                }
+                self.dispatch_event(conn_id, TunnelEvent::Close).await;
             }
             Message::Error { conn_id, message } => {
                 warn!("[{:?}] SSE error: {}", conn_id, message);
                 if let Some(cid) = conn_id {
-                    let tx = {
-                        let channels = self.response_channels.lock().await;
-                        channels.get(&cid).cloned()
-                    };
-                    if let Some(tx) = tx {
-                        let _ = tx.send(TunnelEvent::Error(message)).await;
-                    }
+                    self.dispatch_event(cid, TunnelEvent::Error(message)).await;
                 }
             }
             Message::ExitStatus { conn_id, code } => {
                 debug!("[{}] SSE exit status {}", conn_id, code);
-                let tx = {
-                    let channels = self.response_channels.lock().await;
-                    channels.get(&conn_id).cloned()
-                };
-                if let Some(tx) = tx {
-                    let _ = tx.send(TunnelEvent::Exit(code)).await;
-                }
+                self.dispatch_event(conn_id, TunnelEvent::Exit(code)).await;
             }
             Message::Reset => {
                 // Server signalled the session was freshly created (e.g. it
@@ -399,8 +381,40 @@ impl Tunnel {
     }
 
     /// Register a connection and return event receiver
+    /// Hand one event to a registered connection. Unknown conn_ids are a silent
+    /// no-op (the relay may already have torn down).
+    ///
+    /// Every connection is fed from a single dispatch loop, so this must never
+    /// wait indefinitely: a consumer that has stopped reading fills its queue,
+    /// and an unbounded send would then starve every other connection on the
+    /// tunnel. A connection that makes no progress within
+    /// `DISPATCH_STALL_TIMEOUT` is dropped instead — closing its channel ends
+    /// its relay, which closes the local socket so the app sees the failure.
+    /// Note this bounds the stall, not the latency: dispatch can still be held
+    /// up for one timeout by a consumer that stops reading.
+    async fn dispatch_event(&self, conn_id: u32, event: TunnelEvent) {
+        // Clone the sender out of the guard before awaiting: holding the mutex
+        // across send() would block session ops and every other dispatch too.
+        let tx = {
+            let channels = self.response_channels.lock().await;
+            channels.get(&conn_id).cloned()
+        };
+        let Some(tx) = tx else { return };
+
+        if tokio::time::timeout(DISPATCH_STALL_TIMEOUT, tx.send(event))
+            .await
+            .is_err()
+        {
+            warn!(
+                "[{}] consumer stalled for {:?}; dropping the connection to keep the tunnel moving",
+                conn_id, DISPATCH_STALL_TIMEOUT
+            );
+            self.unregister_connection(conn_id).await;
+        }
+    }
+
     pub async fn register_connection(&self, conn_id: u32) -> mpsc::Receiver<TunnelEvent> {
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(CONN_CHANNEL_CAPACITY);
         let mut channels = self.response_channels.lock().await;
         channels.insert(conn_id, tx);
         rx
@@ -516,5 +530,44 @@ mod tests {
         tunnel.handle_sse_message(&frame).await;
 
         assert!(rx.try_recv().is_err(), "nothing should have been delivered");
+    }
+
+    /// One connection whose consumer has stopped reading must not wedge the
+    /// shared dispatch loop: its channel fills, and an unbounded send there
+    /// parks forever, starving every other connection on the tunnel.
+    /// Time is paused, so the stall timeout elapses without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_consumer_cannot_wedge_the_dispatch_loop() {
+        let tunnel = test_tunnel("pw");
+        // Held but never drained: this is the stalled local app.
+        let _stalled = tunnel.register_connection(1).await;
+        let mut healthy = tunnel.register_connection(2).await;
+
+        // Fill the stalled connection's channel to capacity.
+        let stalled_frame = sse_frame(&tunnel, &Message::Data { conn_id: 1, data: vec![0u8; 8] });
+        for _ in 0..CONN_CHANNEL_CAPACITY {
+            tunnel.handle_sse_message(&stalled_frame).await;
+        }
+
+        // The next send has nowhere to go. It must give up rather than park.
+        tokio::time::timeout(Duration::from_secs(600), tunnel.handle_sse_message(&stalled_frame))
+            .await
+            .expect("dispatch loop parked on a full channel");
+
+        // A wedged connection gets dropped, not carried forever.
+        assert!(
+            !tunnel.response_channels.lock().await.contains_key(&1),
+            "stalled connection should have been torn down"
+        );
+
+        // The whole point: other connections still get served.
+        let healthy_frame = sse_frame(&tunnel, &Message::Data { conn_id: 2, data: b"fine".to_vec() });
+        tokio::time::timeout(Duration::from_secs(600), tunnel.handle_sse_message(&healthy_frame))
+            .await
+            .expect("dispatch to a healthy connection was blocked");
+        match healthy.try_recv() {
+            Ok(TunnelEvent::Data(d)) => assert_eq!(d, b"fine"),
+            other => panic!("expected Data on the healthy conn, got {:?}", other),
+        }
     }
 }

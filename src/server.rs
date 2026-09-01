@@ -647,8 +647,25 @@ async fn relay_tcp_connection(
         }
     });
 
+    let session_watch = session.clone();
     let write_task = tokio::spawn(async move {
-        while let Some(data) = write_rx.recv().await {
+        loop {
+            // The writer now outlives target-output EOF, so nothing else would
+            // wake this task if the client vanished without sending Close.
+            // Bound the wait on the client the same way the PTY relay does.
+            let sse_dead = await_sse_dead(session_watch.clone());
+            tokio::pin!(sse_dead);
+
+            let data = tokio::select! {
+                received = write_rx.recv() => match received {
+                    Some(data) => data,
+                    None => break,
+                },
+                _ = &mut sse_dead => {
+                    debug!("[{}] SSE closed continuously; ending TCP write side", conn_id);
+                    break;
+                }
+            };
             if data.is_empty() {
                 continue;
             }
@@ -840,22 +857,7 @@ async fn relay_pty_connection(
     // SSE has been continuously closed for at least 6s, so transient drops
     // (e.g., a client reconnect within forward_pty_chunk's 5s retry window)
     // don't kill an otherwise-healthy session.
-    let session_watch = session.clone();
-    let sse_dead = async move {
-        let mut closed_secs: u32 = 0;
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let sess = session_watch.lock().await;
-            if sess.sse_tx.is_closed() {
-                closed_secs += 1;
-                if closed_secs >= 6 {
-                    return;
-                }
-            } else {
-                closed_secs = 0;
-            }
-        }
-    };
+    let sse_dead = await_sse_dead(session.clone());
     // Pin to the stack so we can re-poll across loop iterations; the async
     // block holds a !Unpin MutexGuard across .await.
     tokio::pin!(sse_dead);
@@ -990,6 +992,37 @@ async fn forward_pty_chunk(
     }
     error!("[{}] SSE reconnect timed out; dropping PTY output", conn_id);
     false
+}
+
+/// How long a session's SSE stream must stay continuously closed before its
+/// relays treat the client as gone. Long enough that a client reconnecting
+/// inside the send retry window doesn't count as a disconnect.
+const SSE_DEAD_GRACE: Duration = Duration::from_secs(6);
+
+/// Resolves once this session's SSE stream has been closed continuously for
+/// `SSE_DEAD_GRACE`.
+///
+/// An abrupt client disconnect (network drop, killed process) leaves a writer
+/// registered in `tcp_writers` with nothing left to drain it, so a relay's
+/// write task would park on `recv()` forever, holding its target socket open.
+/// Relays that can be left waiting on the client select on this to bound their
+/// teardown. A reconnect replaces `sse_tx` with a live sender and resets the
+/// count, so transient drops don't tear down a healthy session.
+async fn await_sse_dead(session: Arc<Mutex<Session>>) {
+    let mut closed_secs: u32 = 0;
+    let grace_secs = SSE_DEAD_GRACE.as_secs() as u32;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let closed = session.lock().await.sse_tx.is_closed();
+        if closed {
+            closed_secs += 1;
+            if closed_secs >= grace_secs {
+                return;
+            }
+        } else {
+            closed_secs = 0;
+        }
+    }
 }
 
 /// Encrypt `msg` and push it to the (possibly-reconnected) SSE sender, retrying
@@ -1219,6 +1252,65 @@ mod tests {
             Message::Close { conn_id } => assert_eq!(conn_id, CONN_ID),
             other => panic!("expected Close, got {:?}", other),
         }
+    }
+
+    /// A client that vanishes after the target closed its output must not leave
+    /// the relay parked. The writer deliberately outlives target-output EOF so
+    /// uploads can finish, which means nothing else will ever wake the write
+    /// task — only the SSE watchdog can end it. Time is paused, so the grace
+    /// period elapses without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn write_side_gives_up_when_the_client_vanishes() {
+        const CONN_ID: u32 = 44;
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = target.accept().await {
+                drop(sock);
+            }
+        });
+
+        let stream = TcpStream::connect(target_addr).await.unwrap();
+        let (tcp_read, tcp_write) = stream.into_split();
+
+        // Client is gone: its SSE receiver is dropped, so sse_tx is closed.
+        let (sse_tx, sse_rx) = mpsc::channel::<Vec<u8>>(16);
+        drop(sse_rx);
+
+        let crypto = Arc::new(Crypto::new("test-password").unwrap());
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }));
+
+        // Registered writer, held open the way a live client's would be: only
+        // the client's Close would normally remove it, and it never arrives.
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
+        session.lock().await.tcp_writers.insert(CONN_ID, write_tx);
+
+        let relay = tokio::spawn(relay_tcp_connection(
+            CONN_ID,
+            "127.0.0.1",
+            target_addr.port(),
+            tcp_read,
+            tcp_write,
+            write_rx,
+            session.clone(),
+            crypto,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(600), relay)
+            .await
+            .expect("relay never finished: the write side parked on a dead client")
+            .expect("relay task panicked");
+
+        assert!(
+            !session.lock().await.tcp_writers.contains_key(&CONN_ID),
+            "writer should have been cleaned up after teardown"
+        );
     }
 
     /// A terminal `Close` must follow the client across an SSE reconnect. The
