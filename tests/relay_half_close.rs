@@ -144,6 +144,39 @@ fn spawn_read_after_own_eof_target() -> (u16, std::sync::mpsc::Receiver<usize>) 
     (port, report_rx)
 }
 
+/// Target that sends a partial response and then aborts the connection with a
+/// RST, the way a crashing or resetting upstream does. The proxied client must
+/// not be told this ended cleanly.
+#[cfg(unix)]
+fn spawn_reset_midstream_target() -> u16 {
+    use std::os::fd::AsRawFd;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind target");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { continue };
+            let _ = sock.write_all(b"partial");
+            let _ = sock.flush();
+
+            // SO_LINGER with a zero timeout turns close() into a RST instead of
+            // a FIN, so the peer sees a failure rather than end-of-stream.
+            let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+            unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    &linger as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                );
+            }
+            drop(sock);
+        }
+    });
+    port
+}
+
 /// SOCKS5 no-auth handshake + CONNECT to 127.0.0.1:`port`.
 fn socks5_connect(proxy_port: u16, port: u16) -> TcpStream {
     let addr = format!("127.0.0.1:{}", proxy_port);
@@ -286,5 +319,44 @@ fn test_upload_survives_target_output_eof() {
         total, UPLOAD_LEN,
         "upload truncated after target output EOF: target got {} of {} bytes",
         total, UPLOAD_LEN
+    );
+}
+
+/// A target that fails mid-response must not look like one that finished. The
+/// relay reported both as `Close`, so the proxied app saw a clean EOF on a
+/// truncated stream and had no way to tell the difference.
+#[cfg(unix)]
+#[test]
+fn test_target_failure_is_not_a_clean_eof() {
+    let tunnel = start_tunnel("target_reset");
+    let target_port = spawn_reset_midstream_target();
+
+    let mut sock = socks5_connect(tunnel.proxy_port, target_port);
+    sock.write_all(b"go").expect("request write failed");
+    sock.flush().unwrap();
+
+    // Reading to the end must fail, not succeed: the response was truncated by
+    // the target's reset. Whether the partial bytes land first is a race, so
+    // assert only on the property that matters.
+    let mut got = Vec::new();
+    let result = sock.read_to_end(&mut got);
+
+    let err = match result {
+        Ok(_) => panic!(
+            "truncated response was reported as a clean EOF after {} byte(s)",
+            got.len()
+        ),
+        Err(e) => e,
+    };
+    // The failure has to come from the connection being reset, not from this
+    // socket's own read timeout: a relay that simply stalls would otherwise
+    // look identical to one that correctly signalled the failure.
+    assert!(
+        !matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "read timed out instead of the connection being reset: {:?}",
+        err
     );
 }
