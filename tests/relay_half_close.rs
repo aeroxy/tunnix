@@ -1,8 +1,9 @@
-//! Half-close semantics through the SOCKS5 relay.
+//! Half-close semantics through the SOCKS5 relay, in both directions.
 //!
-//! A client that finishes sending (shutdown(WR)) must still receive the full
-//! response. The relay used to tear the response direction down as soon as the
-//! upload direction hit EOF, so the reply was silently truncated or lost.
+//! Each direction of a proxied connection must end on its own. The relay used
+//! to collapse both as soon as either one finished: a client that half-closed
+//! after its request lost the response, and a target that finished sending
+//! first had the rest of the client's upload silently discarded.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -12,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const RESPONSE_LEN: usize = 256 * 1024;
+const UPLOAD_LEN: usize = 16 * 1024 * 1024;
 
 fn find_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
@@ -116,6 +118,32 @@ fn spawn_reply_after_eof_target() -> u16 {
     port
 }
 
+/// Target that closes its *output* first, then keeps reading: it writes a short
+/// greeting, half-closes, and reports how many bytes it received afterwards.
+/// A relay that drops the target writer on output EOF loses the whole upload.
+fn spawn_read_after_own_eof_target() -> (u16, std::sync::mpsc::Receiver<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind target");
+    let port = listener.local_addr().unwrap().port();
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { continue };
+            let _ = sock.write_all(b"hi");
+            let _ = sock.flush();
+            // Our output is done; the peer may still be uploading.
+            let _ = sock.shutdown(Shutdown::Write);
+
+            let mut sink = Vec::new();
+            let received = match sock.read_to_end(&mut sink) {
+                Ok(n) => n,
+                Err(_) => sink.len(),
+            };
+            let _ = report_tx.send(received);
+        }
+    });
+    (port, report_rx)
+}
+
 /// SOCKS5 no-auth handshake + CONNECT to 127.0.0.1:`port`.
 fn socks5_connect(proxy_port: u16, port: u16) -> TcpStream {
     let addr = format!("127.0.0.1:{}", proxy_port);
@@ -140,11 +168,25 @@ fn socks5_connect(proxy_port: u16, port: u16) -> TcpStream {
     sock
 }
 
-#[test]
-fn test_response_survives_client_half_close() {
+/// A running server + client pair with an established tunnel. Both processes
+/// are killed when this is dropped.
+struct Tunnel {
+    proxy_port: u16,
+    tmp: std::path::PathBuf,
+    _server: KillOnDrop,
+    _client: KillOnDrop,
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.tmp);
+    }
+}
+
+fn start_tunnel(name: &str) -> Tunnel {
     let bin = std::env!("CARGO_BIN_EXE_tunnix");
 
-    let tmp = std::env::temp_dir().join(format!("tunnix_half_close_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("tunnix_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create temp dir");
 
@@ -153,11 +195,9 @@ fn test_response_survives_client_half_close() {
 
     let server_port = find_free_port();
     let proxy_port = find_free_port();
-    let target_port = spawn_reply_after_eof_target();
-
     write_config(&config_path, server_port, proxy_port);
 
-    let _server = spawn_direct(
+    let server = spawn_direct(
         bin,
         &[
             "server",
@@ -169,7 +209,7 @@ fn test_response_survives_client_half_close() {
     );
     assert!(wait_for_server(server_port, 10_000), "server did not become ready");
 
-    let _client = spawn_direct(
+    let client = spawn_direct(
         bin,
         &[
             "client",
@@ -186,7 +226,15 @@ fn test_response_survives_client_half_close() {
         "client did not establish tunnel"
     );
 
-    let mut sock = socks5_connect(proxy_port, target_port);
+    Tunnel { proxy_port, tmp, _server: server, _client: client }
+}
+
+#[test]
+fn test_response_survives_client_half_close() {
+    let tunnel = start_tunnel("half_close");
+    let target_port = spawn_reply_after_eof_target();
+
+    let mut sock = socks5_connect(tunnel.proxy_port, target_port);
 
     // Send a request, then half-close: we are done sending, but still expect
     // the whole reply back.
@@ -206,6 +254,37 @@ fn test_response_survives_client_half_close() {
     );
     let expected: Vec<u8> = (0..RESPONSE_LEN).map(|i| (i % 251) as u8).collect();
     assert_eq!(got, expected, "response payload corrupted");
+}
 
-    let _ = std::fs::remove_dir_all(&tmp);
+/// The mirror direction: the *target* finishes sending first, and the upload
+/// still in progress must keep flowing. The server used to drop the target's
+/// writer as soon as target output hit EOF, so everything sent afterwards was
+/// silently discarded.
+#[test]
+fn test_upload_survives_target_output_eof() {
+    let tunnel = start_tunnel("upload_after_eof");
+    let (target_port, received) = spawn_read_after_own_eof_target();
+
+    let mut sock = socks5_connect(tunnel.proxy_port, target_port);
+
+    // Drain the response direction to EOF: the target has half-closed, so the
+    // relay should deliver its greeting and then close only this direction.
+    let mut greeting = Vec::new();
+    sock.read_to_end(&mut greeting).expect("greeting read failed");
+    assert_eq!(greeting, b"hi", "unexpected greeting from target");
+
+    // Response direction is done. The upload direction must still work.
+    let payload: Vec<u8> = (0..UPLOAD_LEN).map(|i| (i % 251) as u8).collect();
+    sock.write_all(&payload).expect("upload failed");
+    sock.flush().unwrap();
+    sock.shutdown(Shutdown::Write).expect("upload half-close failed");
+
+    let total = received
+        .recv_timeout(Duration::from_secs(60))
+        .expect("target never reported a byte count");
+    assert_eq!(
+        total, UPLOAD_LEN,
+        "upload truncated after target output EOF: target got {} of {} bytes",
+        total, UPLOAD_LEN
+    );
 }
