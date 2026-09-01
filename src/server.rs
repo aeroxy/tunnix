@@ -599,6 +599,8 @@ async fn relay_tcp_connection(
         // Set once a delivery has exhausted its retries: the client is then
         // known unreachable, so teardown shouldn't spend another full budget.
         let mut client_gone = false;
+        // Set when the target itself failed, as opposed to closing cleanly.
+        let mut read_failure: Option<String> = None;
         loop {
             match tcp_read.read(&mut buf).await {
                 Ok(0) => {
@@ -625,6 +627,7 @@ async fn relay_tcp_connection(
                 }
                 Err(e) => {
                     debug!("[{}] TCP read error: {}", conn_id, e);
+                    read_failure = Some(e.to_string());
                     break;
                 }
             }
@@ -635,10 +638,29 @@ async fn relay_tcp_connection(
             // teardown bounded: the write task ends once its sender is gone.
             session_clone.lock().await.tcp_writers.remove(&conn_id);
         } else {
-            // The client's relay ends its response direction on this Close, so
-            // it has to arrive: retry across a reconnect instead of making a
+            // A target that failed mid-response must not be reported the same
+            // way as one that finished: Close means "everything arrived", and
+            // the client turns it into a clean EOF for the proxied app. Error
+            // says the stream is truncated, so the app is failed instead of
+            // being handed a short read that looks complete.
+            let terminal = match read_failure {
+                Some(message) => {
+                    // A failed target socket cannot accept an upload either, so
+                    // release its writer instead of holding it for a Close that
+                    // is no longer coming: the client aborts this connection
+                    // rather than finishing its side.
+                    session_clone.lock().await.tcp_writers.remove(&conn_id);
+                    Message::Error {
+                        conn_id: Some(conn_id),
+                        message: format!("target read failed: {}", message),
+                    }
+                }
+                None => Message::Close { conn_id },
+            };
+            // The client's relay ends its response direction on this message,
+            // so it has to arrive: retry across a reconnect instead of making a
             // single attempt that a momentarily-full queue would defeat.
-            let _ = send_to_client(conn_id, &Message::Close { conn_id }, &crypto_clone, &session_clone).await;
+            let _ = send_to_client(conn_id, &terminal, &crypto_clone, &session_clone).await;
             // Deliberately keeping the writer registered: the target closing
             // its output says nothing about the client's upload, which may
             // still be in flight. handle_send drops the writer when the
