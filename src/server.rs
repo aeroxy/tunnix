@@ -630,14 +630,21 @@ async fn relay_tcp_connection(
             }
         }
 
-        // The client's relay ends its response direction on this Close, so it
-        // has to arrive: retry across a reconnect instead of making a single
-        // attempt that a momentarily-full queue would defeat.
-        if !client_gone {
+        if client_gone {
+            // No further uploads can arrive, so drop the writer to keep
+            // teardown bounded: the write task ends once its sender is gone.
+            session_clone.lock().await.tcp_writers.remove(&conn_id);
+        } else {
+            // The client's relay ends its response direction on this Close, so
+            // it has to arrive: retry across a reconnect instead of making a
+            // single attempt that a momentarily-full queue would defeat.
             let _ = send_to_client(conn_id, &Message::Close { conn_id }, &crypto_clone, &session_clone).await;
+            // Deliberately keeping the writer registered: the target closing
+            // its output says nothing about the client's upload, which may
+            // still be in flight. handle_send drops the writer when the
+            // client's own Close arrives, and that is what shuts the target's
+            // write side down.
         }
-        let mut sess = session_clone.lock().await;
-        sess.tcp_writers.remove(&conn_id);
     });
 
     let write_task = tokio::spawn(async move {
@@ -653,10 +660,16 @@ async fn relay_tcp_connection(
         }
     });
 
-    tokio::select! {
-        _ = read_task => {},
-        _ = write_task => {},
-    }
+    // Both directions run to completion independently: the target closing its
+    // output must not cut off an upload still in progress, and a finished
+    // upload must not cut off target output still arriving. The write task ends
+    // when the client's Close drops its sender, or on a target write error.
+    let (_, _) = tokio::join!(read_task, write_task);
+
+    // Idempotent: the normal paths already removed the writer (client Close, or
+    // the client-gone branch above). This catches a target write error, which
+    // ends the write task with the entry still registered.
+    session.lock().await.tcp_writers.remove(&conn_id);
 
     info!("[{}] Connection closed for {}:{}", conn_id, host, port);
 }
