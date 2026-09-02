@@ -961,35 +961,13 @@ async fn relay_pty_connection(
         Message::ExitStatus { conn_id, code },
         Message::Close { conn_id },
     ] {
-        if let Ok(bytes) = msg.to_bytes() {
-            if let Ok(encrypted) = crypto.encrypt(&bytes) {
-                let mut sent = false;
-                // The client is already known gone (writer closed or SSE dead
-                // ≥6s past the reconnect window), so don't spin the full 5s
-                // reconnect retry — one best-effort attempt is enough.
-                let max_retries = if client_gone { 1 } else { 50 };
-                for _ in 0..max_retries {
-                    let sse_tx = {
-                        let sess = session.lock().await;
-                        sess.sse_tx.clone()
-                    };
-                    // Bound each send: a half-open client keeps the old bounded
-                    // channel's receiver alive-but-undrained, so send() would
-                    // park forever and defeat the re-fetch above. On timeout,
-                    // fall through to re-lock and pick up a reconnected sender.
-                    if tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted.clone()))
-                        .await
-                        .is_ok_and(|r| r.is_ok())
-                    {
-                        sent = true;
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                if !sent && !client_gone {
-                    error!("[{}] failed to deliver shutdown message", conn_id);
-                }
-            }
+        // When the client is already known gone (writer closed, or SSE dead
+        // ≥6s past the reconnect window) one best-effort attempt is enough:
+        // spending the full budget only delays teardown to rediscover that.
+        let attempts = if client_gone { 1 } else { SEND_ATTEMPTS };
+        let sent = send_to_client_with_attempts(conn_id, &msg, &crypto, &session, attempts).await;
+        if !sent && !client_gone {
+            error!("[{}] failed to deliver shutdown message", conn_id);
         }
     }
 
@@ -1065,6 +1043,25 @@ async fn await_sse_dead(session: Arc<Mutex<Session>>) {
 /// client from reading the SSE socket; if the two were the same magnitude, that
 /// stall alone would exhaust this budget and tear down healthy connections.
 async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
+    send_to_client_with_attempts(conn_id, msg, crypto, session, SEND_ATTEMPTS).await
+}
+
+/// Delivery attempts `send_to_client` spends before declaring a client
+/// unreachable. See the note on that function for why the resulting budget has
+/// to stay well above the client's `DISPATCH_STALL_TIMEOUT`.
+const SEND_ATTEMPTS: u32 = 50;
+
+/// `send_to_client` with an explicit attempt budget. Only teardown paths that
+/// already know the client is gone should pass anything but `SEND_ATTEMPTS`:
+/// one best-effort attempt still gets the message out if the client happens to
+/// be reachable, without spending the full budget discovering it is not.
+async fn send_to_client_with_attempts(
+    conn_id: u32,
+    msg: &Message,
+    crypto: &Crypto,
+    session: &Arc<Mutex<Session>>,
+    attempts: u32,
+) -> bool {
     let bytes = match msg.to_bytes() {
         Ok(b) => b,
         Err(e) => { error!("[{}] serialize: {}", conn_id, e); return false; }
@@ -1073,7 +1070,7 @@ async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &
         Ok(e) => e,
         Err(e) => { error!("[{}] encrypt: {}", conn_id, e); return false; }
     };
-    for _ in 0..50 {
+    for _ in 0..attempts {
         let sse_tx = {
             let sess = session.lock().await;
             sess.sse_tx.clone()
