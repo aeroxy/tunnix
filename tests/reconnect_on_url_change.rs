@@ -74,6 +74,15 @@ password = ""
     std::fs::write(config_path, content).expect("failed to write config");
 }
 
+/// Everything here talks over loopback, so an ambient proxy in the developer's
+/// environment must not be inherited: the HTTP client honours `*_PROXY` and
+/// would try to reach 127.0.0.1 through it.
+fn no_inherited_proxy(cmd: &mut Command) {
+    for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+        cmd.env_remove(var);
+    }
+}
+
 /// Wraps a Child process and kills it on drop
 struct KillOnDrop(Child);
 
@@ -95,6 +104,12 @@ fn test_client_reconnects_on_server_url_change() {
 
     let config_path = tmp.join("config.toml");
     let log_path = tmp.join("client.log");
+    // The server falls back to ./config.toml and then ~/.config/tunnix/
+    // config.toml when no --config is given, so point it at an empty file in
+    // the test's own directory: an ambient path_prefix would otherwise change
+    // what this test is exercising.
+    let server_config = tmp.join("server.toml");
+    std::fs::write(&server_config, "[server]\n").expect("write server config");
 
     // Find ports
     let port_a = find_free_port();
@@ -110,42 +125,50 @@ fn test_client_reconnects_on_server_url_change() {
 
     write_config(&config_path, port_a, proxy_port);
 
-    let _server_a = KillOnDrop(
-        Command::new(bin)
-            .args([
-                "server",
-                "--listen",
-                &format!("127.0.0.1:{}", port_a),
-                "-p",
-                "test",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to start server A"),
-    );
+    let _server_a = {
+        let mut cmd = Command::new(bin);
+        cmd.args([
+            "server",
+            "--config",
+            server_config.to_str().unwrap(),
+            "--listen",
+            &format!("127.0.0.1:{}", port_a),
+            "-p",
+            "test",
+        ]);
+        no_inherited_proxy(&mut cmd);
+        KillOnDrop(
+            cmd.stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("failed to start server A"),
+        )
+    };
 
     assert!(
         wait_for_server(port_a, 10_000),
         "server A did not become ready"
     );
 
-    let _client = KillOnDrop(
-        Command::new(bin)
-            .args([
-                "client",
-                "--config",
-                config_path.to_str().unwrap(),
-                "--log",
-                log_path.to_str().unwrap(),
-                "-p",
-                "test",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to start client"),
-    );
+    let _client = {
+        let mut cmd = Command::new(bin);
+        cmd.args([
+            "client",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--log",
+            log_path.to_str().unwrap(),
+            "-p",
+            "test",
+        ]);
+        no_inherited_proxy(&mut cmd);
+        KillOnDrop(
+            cmd.stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("failed to start client"),
+        )
+    };
 
     assert!(
         wait_for_log(&log_path, "Tunnel established", 15_000),
@@ -161,20 +184,25 @@ fn test_client_reconnects_on_server_url_change() {
 
     // --- Phase 2: Switch to server B ---
 
-    let _server_b = KillOnDrop(
-        Command::new(bin)
-            .args([
-                "server",
-                "--listen",
-                &format!("127.0.0.1:{}", port_b),
-                "-p",
-                "test",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to start server B"),
-    );
+    let _server_b = {
+        let mut cmd = Command::new(bin);
+        cmd.args([
+            "server",
+            "--config",
+            server_config.to_str().unwrap(),
+            "--listen",
+            &format!("127.0.0.1:{}", port_b),
+            "-p",
+            "test",
+        ]);
+        no_inherited_proxy(&mut cmd);
+        KillOnDrop(
+            cmd.stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("failed to start server B"),
+        )
+    };
 
     assert!(
         wait_for_server(port_b, 10_000),
