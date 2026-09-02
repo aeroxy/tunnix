@@ -51,13 +51,18 @@ pub async fn relay(
         let mut stopped_by_server = false;
         loop {
             let read = tokio::select! {
-                // Cancel-safe: no bytes are consumed if the other branch wins.
-                result = tcp_read.read(&mut buf) => result,
+                // Biased toward the failure signal: once the connection has
+                // failed, every further chunk costs another send_message on the
+                // tunnel that just broke, and an unbiased poll can keep picking
+                // the read for as long as the app has bytes buffered.
+                biased;
                 _ = failed_read.notified() => {
                     debug!("[{}] connection failed; stopping the upload side", conn_id);
                     stopped_by_server = true;
                     break;
                 }
+                // Cancel-safe: no bytes are consumed if the other branch wins.
+                result = tcp_read.read(&mut buf) => result,
             };
             match read {
                 Ok(0) => {
@@ -96,7 +101,20 @@ pub async fn relay(
         // costs a full reconnect wait before failing anyway.
         if !(stopped_by_server && server_reported_read.load(Ordering::SeqCst)) {
             let close_msg = Message::Close { conn_id };
-            let _ = tunnel_clone.send_message(&close_msg).await;
+            if stopped_by_server {
+                // This connection is about to be aborted, and the app is
+                // waiting on a response that will never arrive - it has to find
+                // that out now. send_message can spend a full RECONNECT_WAIT on
+                // the very tunnel whose failure got us here, so it must not sit
+                // between the failure and the RST below. The server still needs
+                // the Close to release the target writer, so hand it off rather
+                // than drop it.
+                tokio::spawn(async move {
+                    let _ = tunnel_clone.send_message(&close_msg).await;
+                });
+            } else {
+                let _ = tunnel_clone.send_message(&close_msg).await;
+            }
         }
 
         // Let the write half stop waiting for a late failure report.
@@ -233,10 +251,11 @@ mod tests {
     /// session Reset clears every channel, and the SSE dispatcher drops a
     /// connection it considers stalled. The response is truncated either way,
     /// so the app must not be handed a clean end-of-stream.
-    /// Time is paused: the read half still reports the connection to the
-    /// server on this path, and this test's tunnel has no server behind it, so
-    /// that send spends its full reconnect wait in virtual time.
-    #[tokio::test(start_paused = true)]
+    /// Real time, deliberately: the read half's teardown Close goes out on a
+    /// detached task, so nothing here waits on the tunnel and the relay tears
+    /// down in milliseconds. A paused clock would auto-advance past any timeout
+    /// set here while that Close was doing real (non-timer) network I/O.
+    #[tokio::test]
     async fn a_dropped_dispatch_channel_is_not_a_clean_eof() {
         const CONN_ID: u32 = 5;
 
@@ -262,7 +281,7 @@ mod tests {
         event_tx.send(TunnelEvent::Data(b"partial".to_vec())).await.unwrap();
         drop(event_tx);
 
-        tokio::time::timeout(Duration::from_secs(600), relay)
+        tokio::time::timeout(Duration::from_secs(10), relay)
             .await
             .expect("relay did not finish")
             .expect("relay panicked");

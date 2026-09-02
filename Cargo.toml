@@ -25,7 +25,9 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.40", features = ["full"] }
+# 1.51: TcpStream::set_zero_linger, used by the relay to abort a failed
+# connection with a RST instead of a FIN the app would read as a clean EOF.
+tokio = { version = "1.51", features = ["full"] }
 rustls = { version = "0.23", features = ["ring"] }
 
 # Encryption
@@ -77,4 +79,4 @@ nix = { version = "0.29", features = ["fs", "term"] }
 [dev-dependencies]
 # `#[tokio::test(start_paused = true)]` lets timeout-driven tests run instantly.
 # Dev-only so the test clock never ships in a release build.
-tokio = { version = "1.40", features = ["full", "test-util"] }
+tokio = { version = "1.51", features = ["full", "test-util"] }
