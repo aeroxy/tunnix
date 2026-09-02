@@ -1014,30 +1014,8 @@ async fn forward_pty_chunk(
     session: &Arc<Mutex<Session>>,
 ) -> bool {
     let msg = Message::Data { conn_id, data };
-    let bytes = match msg.to_bytes() {
-        Ok(b) => b,
-        Err(e) => { error!("[{}] PTY serialize: {}", conn_id, e); return false; }
-    };
-    let encrypted = match crypto.encrypt(&bytes) {
-        Ok(e) => e,
-        Err(e) => { error!("[{}] PTY encrypt: {}", conn_id, e); return false; }
-    };
-    for _ in 0..50 {
-        let sse_tx = {
-            let sess = session.lock().await;
-            sess.sse_tx.clone()
-        };
-        // Bound each send: a half-open client keeps the old bounded channel's
-        // receiver alive-but-undrained, so send() would park forever and defeat
-        // the re-fetch above. On timeout, fall through to pick up a reconnect.
-        if tokio::time::timeout(Duration::from_millis(500), sse_tx.send(encrypted.clone()))
-            .await
-            .is_ok_and(|r| r.is_ok())
-        {
-            return true;
-        }
-        debug!("[{}] SSE stream replaced or closed; retrying", conn_id);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    if send_to_client(conn_id, &msg, crypto, session).await {
+        return true;
     }
     error!("[{}] SSE reconnect timed out; dropping PTY output", conn_id);
     false
@@ -1178,24 +1156,9 @@ async fn relay_push(
     // Watchdog: a client that dies mid-push (network drop, killed process)
     // never sends Close, so its writer sender lingers in `tcp_writers` and the
     // decompressor parks forever on a truncated archive's blocking read. Mirror
-    // the PTY watchdog — once SSE has been closed continuously for 6s, drop the
+    // the PTY watchdog — once SSE has been closed for SSE_DEAD_GRACE, drop the
     // writer to force EOF so the unpack fails cleanly instead of hanging.
-    let session_watch = session.clone();
-    let watchdog = async move {
-        let mut closed_secs: u32 = 0;
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let closed = session_watch.lock().await.sse_tx.is_closed();
-            if closed {
-                closed_secs += 1;
-                if closed_secs >= 6 {
-                    return;
-                }
-            } else {
-                closed_secs = 0;
-            }
-        }
-    };
+    let watchdog = await_sse_dead(session.clone());
 
     tokio::pin!(unpack_handle);
     let join = tokio::select! {
