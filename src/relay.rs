@@ -125,10 +125,10 @@ pub async fn relay(
     let failed_notify = failed;
     let write_task = tokio::spawn(async move {
         // A clean end-of-stream is only ever earned by an explicit terminal
-        // event. Anything else that ends this loop leaves the response
-        // truncated, and handing that to the app as a successful EOF is the
+        // event. Anything else that ends this loop leaves the connection
+        // broken, and handing that to the app as a successful EOF is the
         // silent corruption this relay exists to avoid.
-        let mut terminal_seen = false;
+        let mut channel_dropped = false;
         let mut failed = false;
         // Set once the response direction has closed cleanly. The upload can
         // still fail on the target after that, and the server reports it as a
@@ -142,7 +142,10 @@ pub async fn relay(
                 biased;
                 received = event_rx.recv() => match received {
                     Some(event) => event,
-                    None => break,
+                    None => {
+                        channel_dropped = true;
+                        break;
+                    }
                 },
                 _ = upload_done_write.notified(), if response_closed => {
                     debug!("[{}] upload finished; nothing left to report", conn_id);
@@ -163,7 +166,6 @@ pub async fn relay(
                 }
                 TunnelEvent::Close => {
                     debug!("[{}] tunnel closed", conn_id);
-                    terminal_seen = true;
                     response_closed = true;
                     // Everything arrived: FIN, so the app reads a clean EOF.
                     // Not breaking here - the upload may still fail, and the
@@ -172,24 +174,25 @@ pub async fn relay(
                 }
                 TunnelEvent::Error(msg) => {
                     debug!("[{}] tunnel error: {}", conn_id, msg);
-                    terminal_seen = true;
                     failed = true;
                     server_reported.store(true, Ordering::SeqCst);
                     break;
                 }
                 TunnelEvent::Exit(_) => {
                     // Only meaningful for remote exec; a TCP relay never sees it.
-                    terminal_seen = true;
                     break;
                 }
             }
         }
 
-        // The channel was dropped with no terminal event: the server session
-        // was reset, or the dispatcher dropped this connection as stalled.
-        // Either way the response stopped mid-stream.
-        if !terminal_seen {
-            debug!("[{}] dispatch channel dropped mid-stream", conn_id);
+        // The channel was dropped before the upload finished: the server
+        // session was reset, or the dispatcher dropped this connection as
+        // stalled. Before Close that truncates the response. After Close the
+        // response is complete, but the upload still in progress now lands on
+        // a server that no longer knows this conn_id and discards it with a
+        // 200. Both are failures the app has to see, not a clean EOF.
+        if channel_dropped {
+            debug!("[{}] dispatch channel dropped before the connection finished", conn_id);
             failed = true;
         }
         if failed {
@@ -294,5 +297,46 @@ mod tests {
             "truncated response was handed to the app as a clean EOF after {} byte(s)",
             got.len()
         );
+    }
+
+    /// The channel can also be dropped *after* a clean Close, while the app is
+    /// still uploading. The server that reset no longer knows the conn_id, so
+    /// every further chunk is discarded with a 200. The relay must not sit
+    /// waiting for an app that has no reason to stop; it has to fail the
+    /// connection so the app finds out.
+    #[tokio::test]
+    async fn a_dropped_dispatch_channel_after_close_still_fails_the_connection() {
+        const CONN_ID: u32 = 6;
+
+        // Stand-in for the app: it holds its side open, never closing, the way
+        // an upload in progress would.
+        let listener = StdListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let app = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let _ = release_rx.recv();
+            drop(sock);
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let tunnel = Arc::new(test_tunnel("pw"));
+        let (event_tx, event_rx) = mpsc::channel(8);
+
+        let relay = tokio::spawn(relay(stream, CONN_ID, tunnel, event_rx));
+
+        // Response completes cleanly, then the session is reset mid-upload.
+        event_tx.send(TunnelEvent::Data(b"reply".to_vec())).await.unwrap();
+        event_tx.send(TunnelEvent::Close).await.unwrap();
+        drop(event_tx);
+
+        // Without treating the drop as a failure, the read half keeps waiting
+        // for the app's EOF and this never returns.
+        let finished = tokio::time::timeout(Duration::from_secs(10), relay).await;
+        let _ = release_tx.send(());
+        tokio::task::spawn_blocking(move || app.join().unwrap()).await.unwrap();
+        finished
+            .expect("relay kept waiting on the app after its channel was dropped")
+            .expect("relay panicked");
     }
 }
