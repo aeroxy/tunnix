@@ -15,14 +15,19 @@ use std::time::{Duration, Instant};
 const RESPONSE_LEN: usize = 256 * 1024;
 const UPLOAD_LEN: usize = 16 * 1024 * 1024;
 
+/// Ask the OS for an unused localhost port.
 fn find_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
     listener.local_addr().unwrap().port()
 }
 
+/// Perform a raw GET /health and check for 200.
 fn health_check(port: u16) -> bool {
     let addr = format!("127.0.0.1:{}", port);
     if let Ok(mut stream) = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(1)) {
+        // Bound the read: a socket that accepts and then says nothing would
+        // otherwise hang the poll loop instead of failing this attempt.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let req = "GET /health HTTP/1.0\r\n\r\n";
         let _ = stream.write_all(req.as_bytes());
         let mut resp = String::new();
@@ -33,6 +38,7 @@ fn health_check(port: u16) -> bool {
     false
 }
 
+/// Poll the health endpoint until the server answers or the timeout expires.
 fn wait_for_server(port: u16, timeout_ms: u64) -> bool {
     let start = Instant::now();
     while start.elapsed().as_millis() < timeout_ms as u128 {
@@ -44,6 +50,7 @@ fn wait_for_server(port: u16, timeout_ms: u64) -> bool {
     false
 }
 
+/// Wait for a substring to appear in a log file.
 fn wait_for_log(log_path: &Path, target: &str, timeout_ms: u64) -> bool {
     let start = Instant::now();
     let mut buf = String::new();
@@ -59,6 +66,7 @@ fn wait_for_log(log_path: &Path, target: &str, timeout_ms: u64) -> bool {
     false
 }
 
+/// Write a minimal client config pointing at the given server and proxy ports.
 fn write_config(config_path: &Path, server_port: u16, proxy_port: u16) {
     let content = format!(
         r#"[client]
@@ -70,6 +78,7 @@ password = ""
     std::fs::write(config_path, content).expect("failed to write config");
 }
 
+/// Wraps a child process and kills it on drop.
 struct KillOnDrop(Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -216,6 +225,7 @@ impl Drop for Tunnel {
     }
 }
 
+/// Start a server and client pair and wait until the tunnel is established.
 fn start_tunnel(name: &str) -> Tunnel {
     let bin = std::env!("CARGO_BIN_EXE_tunnix");
 
@@ -230,10 +240,19 @@ fn start_tunnel(name: &str) -> Tunnel {
     let proxy_port = find_free_port();
     write_config(&config_path, server_port, proxy_port);
 
+    // The server falls back to ./config.toml and then ~/.config/tunnix/
+    // config.toml when no --config is given, so point it at an empty file
+    // in the test's own directory: an ambient path_prefix or allow_exec would
+    // otherwise change what these tests are exercising.
+    let server_config = tmp.join("server.toml");
+    std::fs::write(&server_config, "[server]\n").expect("write server config");
+
     let server = spawn_direct(
         bin,
         &[
             "server",
+            "--config",
+            server_config.to_str().unwrap(),
             "--listen",
             &format!("127.0.0.1:{}", server_port),
             "-p",

@@ -1,7 +1,6 @@
 use crate::tunnel::{Tunnel, TunnelEvent};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
@@ -37,17 +36,26 @@ pub async fn relay(
     // practice by the app being a local process rather than a remote peer.
     let failed = Arc::new(Notify::new());
     let failed_read = failed.clone();
+    // Whether that failure was the server's own report. It has then already
+    // released the target writer, so the Close below would be redundant.
+    let server_reported = Arc::new(AtomicBool::new(false));
+    let server_reported_read = server_reported.clone();
+    // Raised by the read half once the upload side is done, so the write half
+    // knows no further failure report can arrive.
+    let upload_done = Arc::new(Notify::new());
+    let upload_done_write = upload_done.clone();
 
     let read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 32768];
-        let mut give_up = false;
+        // Set when the write half stopped us after the server reported failure.
+        let mut stopped_by_server = false;
         loop {
             let read = tokio::select! {
                 // Cancel-safe: no bytes are consumed if the other branch wins.
                 result = tcp_read.read(&mut buf) => result,
                 _ = failed_read.notified() => {
                     debug!("[{}] connection failed; stopping the upload side", conn_id);
-                    give_up = true;
+                    stopped_by_server = true;
                     break;
                 }
             };
@@ -79,12 +87,20 @@ pub async fn relay(
         // the conn_id here: the target may still be streaming a response, and
         // dropping the dispatch channel now would discard it.
         //
-        // Skipped when the connection failed: the target socket is already gone
-        // and the server has released its writer, so there is nothing to close.
-        if !give_up {
+        // Sent on local failures too, not just clean EOF: only the server can
+        // release the target writer, and when the failure is ours it has heard
+        // nothing — its SSE watchdog cannot help while our stream is still
+        // alive, so without this the writer is held indefinitely. Skipped only
+        // when the server itself reported the failure, having already released
+        // the writer: the POST would be redundant, and on a broken tunnel it
+        // costs a full reconnect wait before failing anyway.
+        if !(stopped_by_server && server_reported_read.load(Ordering::SeqCst)) {
             let close_msg = Message::Close { conn_id };
             let _ = tunnel_clone.send_message(&close_msg).await;
         }
+
+        // Let the write half stop waiting for a late failure report.
+        upload_done.notify_one();
         tcp_read
     });
 
@@ -96,7 +112,25 @@ pub async fn relay(
         // silent corruption this relay exists to avoid.
         let mut terminal_seen = false;
         let mut failed = false;
-        while let Some(event) = event_rx.recv().await {
+        // Set once the response direction has closed cleanly. The upload can
+        // still fail on the target after that, and the server reports it as a
+        // late Error, so this half keeps draining until the upload side is
+        // done rather than exiting on Close and losing that report.
+        let mut response_closed = false;
+        loop {
+            let event = tokio::select! {
+                // Biased so queued events are always drained before the exit
+                // signal wins: a late Error must not be lost to the race.
+                biased;
+                received = event_rx.recv() => match received {
+                    Some(event) => event,
+                    None => break,
+                },
+                _ = upload_done_write.notified(), if response_closed => {
+                    debug!("[{}] upload finished; nothing left to report", conn_id);
+                    break;
+                }
+            };
             match event {
                 TunnelEvent::Data(data) => {
                     if data.is_empty() {
@@ -112,14 +146,17 @@ pub async fn relay(
                 TunnelEvent::Close => {
                     debug!("[{}] tunnel closed", conn_id);
                     terminal_seen = true;
+                    response_closed = true;
                     // Everything arrived: FIN, so the app reads a clean EOF.
+                    // Not breaking here - the upload may still fail, and the
+                    // app has to hear about it.
                     let _ = tcp_write.shutdown().await;
-                    break;
                 }
                 TunnelEvent::Error(msg) => {
                     debug!("[{}] tunnel error: {}", conn_id, msg);
                     terminal_seen = true;
                     failed = true;
+                    server_reported.store(true, Ordering::SeqCst);
                     break;
                 }
                 TunnelEvent::Exit(_) => {
@@ -172,12 +209,11 @@ pub async fn relay(
     };
     match read_half.reunite(write_half) {
         Ok(stream) => {
-            // Deprecated in tokio because a *non-zero* linger blocks the thread
-            // on drop. A zero timeout is the opposite: it makes close() return
-            // immediately and emit RST, which is exactly the signal wanted here.
-            #[allow(deprecated)]
-            let linger = stream.set_linger(Some(Duration::ZERO));
-            if let Err(e) = linger {
+            // Zero linger makes close() return immediately and emit RST, which
+            // is exactly the signal wanted here. (The general set_linger is
+            // deprecated because a *non-zero* timeout blocks the thread on
+            // drop; this dedicated call carries no such warning.)
+            if let Err(e) = stream.set_zero_linger() {
                 debug!("[{}] could not set SO_LINGER, closing with FIN: {}", conn_id, e);
             }
         }
@@ -188,6 +224,7 @@ pub async fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use crate::tunnel::tests::test_tunnel;
     use std::io::Read as _;
     use std::net::TcpListener as StdListener;
@@ -196,7 +233,10 @@ mod tests {
     /// session Reset clears every channel, and the SSE dispatcher drops a
     /// connection it considers stalled. The response is truncated either way,
     /// so the app must not be handed a clean end-of-stream.
-    #[tokio::test]
+    /// Time is paused: the read half still reports the connection to the
+    /// server on this path, and this test's tunnel has no server behind it, so
+    /// that send spends its full reconnect wait in virtual time.
+    #[tokio::test(start_paused = true)]
     async fn a_dropped_dispatch_channel_is_not_a_clean_eof() {
         const CONN_ID: u32 = 5;
 
@@ -222,7 +262,7 @@ mod tests {
         event_tx.send(TunnelEvent::Data(b"partial".to_vec())).await.unwrap();
         drop(event_tx);
 
-        tokio::time::timeout(Duration::from_secs(10), relay)
+        tokio::time::timeout(Duration::from_secs(600), relay)
             .await
             .expect("relay did not finish")
             .expect("relay panicked");
