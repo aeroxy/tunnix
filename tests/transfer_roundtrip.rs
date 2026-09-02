@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,8 +42,30 @@ impl Drop for KillOnDrop {
     }
 }
 
-fn start_server(bin: &str, port: u16, allow_transfer: bool) -> KillOnDrop {
+/// Everything here talks over loopback, so an ambient proxy in the developer's
+/// environment must not be inherited: the HTTP client honours `*_PROXY` and
+/// would try to reach 127.0.0.1 through it.
+fn no_inherited_proxy(cmd: &mut Command) {
+    for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+        cmd.env_remove(var);
+    }
+}
+
+/// Write an empty config for a spawned process to use. Without `--config` the
+/// binary falls back to ./config.toml and then ~/.config/tunnix/config.toml, so
+/// a developer's own `allow_transfer = true` would silently decide what these
+/// tests are actually exercising.
+fn write_empty_config(tmp: &Path, name: &str, section: &str) -> std::path::PathBuf {
+    let path = tmp.join(name);
+    std::fs::write(&path, format!("[{}]\n", section)).expect("write config");
+    path
+}
+
+fn start_server(bin: &str, tmp: &Path, port: u16, allow_transfer: bool) -> KillOnDrop {
+    let config = write_empty_config(tmp, "server.toml", "server");
     let mut args = vec![
+        "--config".to_string(),
+        config.to_str().unwrap().to_string(),
         "server".to_string(),
         "--listen".to_string(),
         format!("127.0.0.1:{}", port),
@@ -52,10 +75,11 @@ fn start_server(bin: &str, port: u16, allow_transfer: bool) -> KillOnDrop {
     if allow_transfer {
         args.push("--allow-transfer".to_string());
     }
+    let mut cmd = Command::new(bin);
+    cmd.args(&args);
+    no_inherited_proxy(&mut cmd);
     KillOnDrop(
-        Command::new(bin)
-            .args(&args)
-            .stdout(Stdio::null())
+        cmd.stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("failed to start server"),
@@ -64,8 +88,11 @@ fn start_server(bin: &str, port: u16, allow_transfer: bool) -> KillOnDrop {
 
 /// Run `tunnix push|pull <paths...>` and return whether it exited successfully.
 /// `paths` is the cp-style source(s)... + destination tail.
-fn run_transfer(bin: &str, port: u16, sub: &str, paths: &[&str]) -> bool {
+fn run_transfer(bin: &str, tmp: &Path, port: u16, sub: &str, paths: &[&str]) -> bool {
+    let config = write_empty_config(tmp, "client.toml", "client");
     let mut args = vec![
+        "--config".to_string(),
+        config.to_str().unwrap().to_string(),
         sub.to_string(),
         "-s".to_string(),
         format!("http://127.0.0.1:{}", port),
@@ -73,9 +100,10 @@ fn run_transfer(bin: &str, port: u16, sub: &str, paths: &[&str]) -> bool {
         "test".to_string(),
     ];
     args.extend(paths.iter().map(|s| s.to_string()));
-    Command::new(bin)
-        .args(&args)
-        .stdout(Stdio::null())
+    let mut cmd = Command::new(bin);
+    cmd.args(&args);
+    no_inherited_proxy(&mut cmd);
+    cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .expect("failed to run transfer")
@@ -98,13 +126,13 @@ fn test_push_pull_roundtrip() {
     std::fs::write(src.join("nested/big.bin"), &big).unwrap();
 
     let port = find_free_port();
-    let _server = start_server(bin, port, true);
+    let _server = start_server(bin, &tmp, port, true);
     assert!(wait_for_server(port, 10_000), "server did not become ready");
 
     // --- push: src -> server-side `remote/` (unpacks to remote/src/...) ---
     let remote = tmp.join("remote");
     assert!(
-        run_transfer(bin, port, "push", &[src.to_str().unwrap(), remote.to_str().unwrap()]),
+        run_transfer(bin, &tmp, port, "push", &[src.to_str().unwrap(), remote.to_str().unwrap()]),
         "push failed"
     );
     assert_eq!(
@@ -117,7 +145,7 @@ fn test_push_pull_roundtrip() {
     let pulled = tmp.join("pulled");
     let remote_src = remote.join("src");
     assert!(
-        run_transfer(bin, port, "pull", &[remote_src.to_str().unwrap(), pulled.to_str().unwrap()]),
+        run_transfer(bin, &tmp, port, "pull", &[remote_src.to_str().unwrap(), pulled.to_str().unwrap()]),
         "pull failed"
     );
     assert_eq!(
@@ -145,7 +173,7 @@ fn test_push_pull_multiple_sources() {
     std::fs::write(dir.join("inner.txt"), b"nested").unwrap();
 
     let port = find_free_port();
-    let _server = start_server(bin, port, true);
+    let _server = start_server(bin, &tmp, port, true);
     assert!(wait_for_server(port, 10_000), "server did not become ready");
 
     // push one.txt two.txt dir/ -> remote/  (last arg is the dest)
@@ -153,6 +181,7 @@ fn test_push_pull_multiple_sources() {
     assert!(
         run_transfer(
             bin,
+            &tmp,
             port,
             "push",
             &[
@@ -173,6 +202,7 @@ fn test_push_pull_multiple_sources() {
     assert!(
         run_transfer(
             bin,
+            &tmp,
             port,
             "pull",
             &[
@@ -203,16 +233,16 @@ fn test_transfer_denied_when_disabled() {
     std::fs::write(src.join("a.txt"), b"nope").unwrap();
 
     let port = find_free_port();
-    let _server = start_server(bin, port, false); // allow_transfer OFF
+    let _server = start_server(bin, &tmp, port, false); // allow_transfer OFF
     assert!(wait_for_server(port, 10_000), "server did not become ready");
 
     let remote = tmp.join("remote");
     assert!(
-        !run_transfer(bin, port, "push", &[src.to_str().unwrap(), remote.to_str().unwrap()]),
+        !run_transfer(bin, &tmp, port, "push", &[src.to_str().unwrap(), remote.to_str().unwrap()]),
         "push should fail when transfers are disabled"
     );
     assert!(
-        !run_transfer(bin, port, "pull", &[remote.to_str().unwrap(), tmp.join("pulled").to_str().unwrap()]),
+        !run_transfer(bin, &tmp, port, "pull", &[remote.to_str().unwrap(), tmp.join("pulled").to_str().unwrap()]),
         "pull should fail when transfers are disabled"
     );
 
