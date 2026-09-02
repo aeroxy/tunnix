@@ -387,7 +387,6 @@ impl Tunnel {
         }
     }
 
-    /// Register a connection and return event receiver
     /// Hand one event to a registered connection. Unknown conn_ids are a silent
     /// no-op (the relay may already have torn down).
     ///
@@ -420,6 +419,7 @@ impl Tunnel {
         }
     }
 
+    /// Register a connection and return event receiver
     pub async fn register_connection(&self, conn_id: u32) -> mpsc::Receiver<TunnelEvent> {
         let (tx, rx) = mpsc::channel(CONN_CHANNEL_CAPACITY);
         let mut channels = self.response_channels.lock().await;

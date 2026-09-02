@@ -653,6 +653,16 @@ async fn relay_tcp_connection(
             // No further uploads can arrive, so drop the writer to keep
             // teardown bounded: the write task ends once its sender is gone.
             session_clone.lock().await.tcp_writers.remove(&conn_id);
+            // The client is known unreachable, so spend one attempt, not the
+            // full budget (as the PTY teardown does). It still matters: a
+            // client that has just reconnected would otherwise never hear
+            // that this connection died, and its relay would sit until the
+            // proxied app gave up on its own.
+            let msg = Message::Error {
+                conn_id: Some(conn_id),
+                message: "client unreachable; target relay abandoned".to_string(),
+            };
+            let _ = send_to_client_with_attempts(conn_id, &msg, &crypto_clone, &session_clone, 1).await;
         } else {
             // A target that failed mid-response must not be reported the same
             // way as one that finished: Close means "everything arrived", and
@@ -676,12 +686,20 @@ async fn relay_tcp_connection(
             // The client's relay ends its response direction on this message,
             // so it has to arrive: retry across a reconnect instead of making a
             // single attempt that a momentarily-full queue would defeat.
-            let _ = send_to_client(conn_id, &terminal, &crypto_clone, &session_clone).await;
-            // Deliberately keeping the writer registered: the target closing
-            // its output says nothing about the client's upload, which may
-            // still be in flight. handle_send drops the writer when the
-            // client's own Close arrives, and that is what shuts the target's
-            // write side down.
+            if send_to_client(conn_id, &terminal, &crypto_clone, &session_clone).await {
+                // Deliberately keeping the writer registered: the target
+                // closing its output says nothing about the client's upload,
+                // which may still be in flight. handle_send drops the writer
+                // when the client's own Close arrives, and that is what shuts
+                // the target's write side down.
+            } else {
+                // The client exhausted the delivery budget, so its Close is
+                // not coming either. Release the writer now instead of leaving
+                // the write task to wait on the SSE watchdog, which never
+                // fires for a client whose stream is open but wedged.
+                debug!("[{}] SSE unreachable after target EOF; releasing target writer", conn_id);
+                session_clone.lock().await.tcp_writers.remove(&conn_id);
+            }
         }
     });
 
