@@ -1099,7 +1099,7 @@ async fn send_to_client_with_attempts(
         Ok(e) => e,
         Err(e) => { error!("[{}] encrypt: {}", conn_id, e); return false; }
     };
-    for _ in 0..attempts {
+    for attempt in 0..attempts {
         let sse_tx = {
             let sess = session.lock().await;
             sess.sse_tx.clone()
@@ -1113,7 +1113,12 @@ async fn send_to_client_with_attempts(
         {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Space out retries only when there is another one coming: a caller
+        // that already knows the client is gone spends one attempt, and should
+        // not pay a backoff on its way to giving up.
+        if attempt + 1 < attempts {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     false
 }

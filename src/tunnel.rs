@@ -36,6 +36,11 @@ const CONN_CHANNEL_CAPACITY: usize = 256;
 /// healthy connections and tear them down as unreachable. 5s is still ~20x what
 /// a draining 256-slot queue needs.
 const DISPATCH_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a stalled `Close` may wait off the dispatch loop before its
+/// connection is given up on. Generous where `DISPATCH_STALL_TIMEOUT` is tight:
+/// this wait blocks no other connection, and the alternative is resetting an
+/// app whose response was in fact complete.
+const CLOSE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Events received from server via SSE
 #[derive(Debug)]
@@ -398,6 +403,9 @@ impl Tunnel {
     /// its relay, which closes the local socket so the app sees the failure.
     /// Note this bounds the stall, not the latency: dispatch can still be held
     /// up for one timeout by a consumer that stops reading.
+    ///
+    /// `Close` is the exception, and is handed off instead of dropped — see
+    /// below.
     async fn dispatch_event(&self, conn_id: u32, event: TunnelEvent) {
         // Clone the sender out of the guard before awaiting: holding the mutex
         // across send() would block session ops and every other dispatch too.
@@ -407,16 +415,48 @@ impl Tunnel {
         };
         let Some(tx) = tx else { return };
 
-        if tokio::time::timeout(DISPATCH_STALL_TIMEOUT, tx.send(event))
-            .await
-            .is_err()
-        {
-            warn!(
-                "[{}] consumer stalled for {:?}; dropping the connection to keep the tunnel moving",
-                conn_id, DISPATCH_STALL_TIMEOUT
-            );
-            self.unregister_connection(conn_id).await;
+        // reserve() rather than send(): a send that loses its race with the
+        // timeout drops the event with it, and the stalled `Close` below has to
+        // survive to be handed off.
+        let stalled = match tokio::time::timeout(DISPATCH_STALL_TIMEOUT, tx.reserve()).await {
+            Ok(Ok(permit)) => {
+                permit.send(event);
+                return;
+            }
+            // Receiver gone: the relay already tore down. Nothing to report.
+            Ok(Err(_)) => return,
+            Err(_) => event,
+        };
+
+        // Dropping the connection here is right for a stalled `Data`: the
+        // response is truncated whatever we do, so the app has to be failed.
+        // A stalled `Close` is not - everything before it is already queued, so
+        // the app's response is complete and dropping the connection would
+        // reset it over nothing but the end-of-stream marker. Wait that one out
+        // off the dispatch loop, where it starves nobody. Ordering is safe: the
+        // only event that can follow a `Close` is a late `Error`, and an
+        // `Error` that overtakes it just fails the connection - which is what
+        // that `Error` means anyway.
+        if matches!(stalled, TunnelEvent::Close) {
+            debug!("[{}] consumer stalled; delivering Close off the dispatch loop", conn_id);
+            let channels = self.response_channels.clone();
+            tokio::spawn(async move {
+                if tokio::time::timeout(CLOSE_HANDOFF_TIMEOUT, tx.send(stalled))
+                    .await
+                    .is_err()
+                {
+                    warn!("[{}] consumer never took its Close; dropping the connection", conn_id);
+                    channels.lock().await.remove(&conn_id);
+                }
+            });
+            return;
         }
+
+        warn!(
+            "[{}] consumer stalled for {:?}; dropping the connection to keep the tunnel moving",
+            conn_id, DISPATCH_STALL_TIMEOUT
+        );
+        self.unregister_connection(conn_id).await;
     }
 
     /// Register a connection and return event receiver
@@ -576,5 +616,42 @@ pub(crate) mod tests {
             Ok(TunnelEvent::Data(d)) => assert_eq!(d, b"fine"),
             other => panic!("expected Data on the healthy conn, got {:?}", other),
         }
+    }
+
+    /// A `Close` that arrives while the consumer is stalled must not tear the
+    /// connection down: every byte before it is already queued, so the app's
+    /// response is complete and dropping it would reset the app over nothing
+    /// but the end-of-stream marker. Time is paused, so the stall timeout
+    /// elapses without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_close_is_handed_off_rather_than_dropped() {
+        let tunnel = test_tunnel("pw");
+        let mut rx = tunnel.register_connection(1).await;
+
+        // Fill the queue: the app has stopped reading mid-response.
+        let data = sse_frame(&tunnel, &Message::Data { conn_id: 1, data: vec![7u8; 8] });
+        for _ in 0..CONN_CHANNEL_CAPACITY {
+            tunnel.handle_sse_message(&data).await;
+        }
+
+        // The Close has nowhere to go. Dispatch must neither park on it nor
+        // drop the connection because of it.
+        let close = sse_frame(&tunnel, &Message::Close { conn_id: 1 });
+        tokio::time::timeout(Duration::from_secs(600), tunnel.handle_sse_message(&close))
+            .await
+            .expect("dispatch loop parked on a stalled Close");
+        assert!(
+            tunnel.response_channels.lock().await.contains_key(&1),
+            "a stalled Close should not tear the connection down"
+        );
+
+        // The app resumes reading: it gets its whole response, then the Close.
+        for _ in 0..CONN_CHANNEL_CAPACITY {
+            assert!(matches!(rx.recv().await, Some(TunnelEvent::Data(_))));
+        }
+        assert!(
+            matches!(rx.recv().await, Some(TunnelEvent::Close)),
+            "the handed-off Close never arrived"
+        );
     }
 }
