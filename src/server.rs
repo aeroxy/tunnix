@@ -594,7 +594,12 @@ async fn relay_tcp_connection(
 ) {
     let crypto_clone = crypto.clone();
     let session_clone = session.clone();
+    // Resolves once the read task has ended, however it ended: the sender is
+    // moved into that task, so a panic drops it too. The write side uses it to
+    // hold off starting its own watchdog - see there.
+    let (read_done_tx, read_done_rx) = tokio::sync::oneshot::channel::<()>();
     let read_task = tokio::spawn(async move {
+        let _read_done = read_done_tx;
         let mut buf = vec![0u8; 32768];
         // Set once a delivery has exhausted its retries: the client is then
         // known unreachable, so teardown shouldn't spend another full budget.
@@ -704,12 +709,27 @@ async fn relay_tcp_connection(
     });
 
     let session_watch = session.clone();
+    let session_dead = session.clone();
     let write_task = tokio::spawn(async move {
         // The writer now outlives target-output EOF, so nothing else would wake
         // this task if the client vanished without sending Close. Bound the
-        // wait on the client the same way the PTY relay does. Pinned once, like
-        // the PTY relay: the counter resets itself whenever the stream is live.
-        let sse_dead = await_sse_dead(session_watch.clone());
+        // wait on the client the same way the PTY relay does.
+        //
+        // Deliberately not started until the read task is gone. While both
+        // halves are live, that task's own watchdog (and its failing
+        // deliveries) already cover a vanished client: every one of those paths
+        // removes this writer, which ends this task through `recv()`. Only once
+        // the read task has finished - having kept the writer registered past
+        // target-output EOF - is there nothing left to wake us. So one watchdog
+        // timer runs per connection instead of two, and until then this future
+        // is parked on a channel rather than ticking. Awaiting the sender's
+        // *drop* rather than a value covers a read task that panicked.
+        let sse_dead = async move {
+            let _ = read_done_rx.await;
+            // Pinned by the caller below: the counter resets itself whenever
+            // the stream is live.
+            await_sse_dead(session_dead).await;
+        };
         tokio::pin!(sse_dead);
         loop {
             let data = tokio::select! {
@@ -984,8 +1004,15 @@ async fn relay_pty_connection(
         // spending the full budget only delays teardown to rediscover that.
         let attempts = if client_gone { 1 } else { SEND_ATTEMPTS };
         let sent = send_to_client_with_attempts(conn_id, &msg, &crypto, &session, attempts).await;
-        if !sent && !client_gone {
-            error!("[{}] failed to deliver shutdown message", conn_id);
+        if !sent {
+            if !client_gone {
+                error!("[{}] failed to deliver shutdown message", conn_id);
+            }
+            // Stop at the first failure, as relay_pull and relay_push do: a
+            // false return means the client is unreachable, so spending a
+            // second full budget on the Close only delays teardown to
+            // rediscover that.
+            break;
         }
     }
 
@@ -1354,6 +1381,87 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(600), relay)
             .await
             .expect("relay never finished: the write side parked on a dead client")
+            .expect("relay task panicked");
+
+        assert!(
+            !session.lock().await.tcp_writers.contains_key(&CONN_ID),
+            "writer should have been cleaned up after teardown"
+        );
+    }
+
+    /// The write side's watchdog is deliberately not started until the read
+    /// task has gone, so this covers the one case that actually depends on it:
+    /// the target closes its output cleanly, the terminal `Close` is delivered,
+    /// and the writer is kept registered so an upload could still finish. The
+    /// read task is then finished and nothing else can wake this half, so only
+    /// the watchdog can end it once the client vanishes. Time is paused, so the
+    /// grace period elapses without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn write_side_watchdog_starts_after_the_read_task_keeps_the_writer() {
+        const CONN_ID: u32 = 46;
+
+        // Target that closes its output immediately: a clean EOF, not a failure,
+        // so the read task sends Close and keeps the writer.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = target.accept().await {
+                drop(sock);
+            }
+        });
+
+        let stream = TcpStream::connect(target_addr).await.unwrap();
+        let (tcp_read, tcp_write) = stream.into_split();
+
+        // Healthy client to begin with, so the terminal Close is delivered and
+        // the writer is deliberately left registered.
+        let (sse_tx, mut sse_rx) = mpsc::channel::<Vec<u8>>(16);
+
+        let crypto = Arc::new(Crypto::new("test-password").unwrap());
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }));
+
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
+        session.lock().await.tcp_writers.insert(CONN_ID, write_tx);
+
+        let relay = tokio::spawn(relay_tcp_connection(
+            CONN_ID,
+            "127.0.0.1",
+            target_addr.port(),
+            tcp_read,
+            tcp_write,
+            write_rx,
+            session.clone(),
+            crypto.clone(),
+        ));
+
+        // Wait for the Close: past this point the read task has finished and
+        // has left the writer in place, so the write half is parked with
+        // nothing but its watchdog left to end it.
+        let queued = tokio::time::timeout(Duration::from_secs(60), sse_rx.recv())
+            .await
+            .expect("terminal Close never arrived")
+            .expect("SSE channel closed before the Close arrived");
+        let decrypted = crypto.decrypt(&queued).unwrap();
+        match Message::from_bytes(&decrypted).unwrap() {
+            Message::Close { conn_id } => assert_eq!(conn_id, CONN_ID),
+            other => panic!("expected Close, got {:?}", other),
+        }
+        assert!(
+            session.lock().await.tcp_writers.contains_key(&CONN_ID),
+            "the writer should outlive target-output EOF so an upload can finish"
+        );
+
+        // Now the client vanishes.
+        drop(sse_rx);
+
+        tokio::time::timeout(Duration::from_secs(600), relay)
+            .await
+            .expect("write side parked: its watchdog never started after the read task ended")
             .expect("relay task panicked");
 
         assert!(
