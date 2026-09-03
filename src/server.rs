@@ -1031,12 +1031,23 @@ const SSE_DEAD_GRACE: Duration = Duration::from_secs(6);
 /// Relays that can be left waiting on the client select on this to bound their
 /// teardown. A reconnect replaces `sse_tx` with a live sender and resets the
 /// count, so transient drops don't tear down a healthy session.
+///
+/// `try_lock`, never `lock().await`: callers hold this future inside a
+/// `select!` that stops polling it the instant the other branch wins, and
+/// tokio's mutex is fair - it hands the freed lock to the waiter at the head of
+/// its queue whether or not anyone is still polling it. A watchdog that queued
+/// there would strand the lock, and every later `send_to_client` on that
+/// session would park on it forever. A tick that loses the race is simply
+/// skipped: the counter is left alone rather than reset, so a contended lock
+/// delays this watchdog but cannot defeat it.
 async fn await_sse_dead(session: Arc<Mutex<Session>>) {
     let mut closed_secs: u32 = 0;
     let grace_secs = SSE_DEAD_GRACE.as_secs() as u32;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let closed = session.lock().await.sse_tx.is_closed();
+        let Ok(sess) = session.try_lock() else { continue };
+        let closed = sess.sse_tx.is_closed();
+        drop(sess);
         if closed {
             closed_secs += 1;
             if closed_secs >= grace_secs {
@@ -1462,5 +1473,46 @@ mod tests {
             Message::Close { conn_id } => assert_eq!(conn_id, CONN_ID),
             other => panic!("expected Close, got {:?}", other),
         }
+    }
+
+    /// The watchdog lives inside a `select!` that stops polling it the moment
+    /// the other branch wins. Tokio's mutex is fair, so a freed lock is handed
+    /// to the waiter at the head of its queue whether or not anyone is still
+    /// polling it: a watchdog that queued on `session.lock()` strands the lock,
+    /// and every later `send_to_client` on that session parks on it forever -
+    /// the relay goes silent mid-connection with no error anywhere.
+    /// Time is paused, so the watchdog's tick elapses without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn the_sse_watchdog_never_strands_the_session_lock() {
+        let (sse_tx, _sse_rx) = mpsc::channel::<Vec<u8>>(16);
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }));
+
+        // Someone else holds the lock, as `handle_send` briefly does for every
+        // uploaded chunk.
+        let held = session.clone().lock_owned().await;
+
+        let watchdog = await_sse_dead(session.clone());
+        tokio::pin!(watchdog);
+        // Poll the watchdog past its first tick, into the point where it wants
+        // the session lock, then abandon it - exactly what `select!` does each
+        // time the relay's other branch wins.
+        for _ in 0..5 {
+            tokio::select! {
+                biased;
+                _ = &mut watchdog => unreachable!("the stream is live; this must not fire"),
+                _ = tokio::time::sleep(Duration::from_millis(400)) => {}
+            }
+        }
+
+        drop(held);
+        let regained = tokio::time::timeout(Duration::from_secs(30), session.lock())
+            .await
+            .expect("watchdog stranded the session lock: every send_to_client would park here");
+        drop(regained);
     }
 }
