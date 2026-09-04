@@ -82,6 +82,20 @@ pub enum Message {
         conn_id: u32,
         path: String,
     },
+
+    /// Client tells the server a connection is dead on its side: the proxied
+    /// app aborted, or the client's relay failed. Unlike `Close`, which only
+    /// half-closes the upload direction and leaves the target's output
+    /// flowing, this releases the target entirely - the server stops reading
+    /// it and drops the socket. Without it an abandoned download is pulled to
+    /// completion into a conn_id the client no longer knows.
+    ///
+    /// Appended last so existing variant indices are unchanged on the wire.
+    /// An older server fails to decode it and answers 200, so mixed versions
+    /// degrade to the previous behaviour rather than breaking.
+    Abort {
+        conn_id: u32,
+    },
 }
 
 impl Message {
@@ -119,6 +133,15 @@ mod tests {
             }
             _ => panic!("Wrong message type"),
         }
+    }
+
+    #[test]
+    fn test_abort_message() {
+        let bytes = Message::Abort { conn_id: 9 }.to_bytes().unwrap();
+        assert!(matches!(
+            Message::from_bytes(&bytes).unwrap(),
+            Message::Abort { conn_id: 9 }
+        ));
     }
 
     #[test]

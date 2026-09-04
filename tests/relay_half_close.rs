@@ -186,6 +186,26 @@ fn spawn_reset_midstream_target() -> u16 {
     port
 }
 
+/// Target that streams until its socket fails, then reports how long it kept
+/// writing. A relay that treats a client abort as a mere half-close leaves the
+/// server pulling this until the cap below.
+fn spawn_endless_target() -> (u16, std::sync::mpsc::Receiver<Duration>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind target");
+    let port = listener.local_addr().unwrap().port();
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { continue };
+            let chunk = vec![7u8; 65536];
+            let started = Instant::now();
+            // Capped so a regression fails the assertion instead of hanging.
+            while started.elapsed() < Duration::from_secs(20) && sock.write_all(&chunk).is_ok() {}
+            let _ = report_tx.send(started.elapsed());
+        }
+    });
+    (port, report_rx)
+}
+
 /// SOCKS5 no-auth handshake + CONNECT to 127.0.0.1:`port`.
 fn socks5_connect(proxy_port: u16, port: u16) -> TcpStream {
     let addr = format!("127.0.0.1:{}", proxy_port);
@@ -384,5 +404,49 @@ fn test_target_failure_is_not_a_clean_eof() {
         ),
         "read timed out instead of the connection being reset: {:?}",
         err
+    );
+}
+
+/// An app that *aborts* - as opposed to half-closing - must release the target
+/// on the server, not just the upload direction. `Close` only half-closes,
+/// which is right for an app that finished sending and still wants its reply,
+/// so a relay that sent `Close` on abort too left the server pulling the whole
+/// remaining response into a conn_id the client had already forgotten: a
+/// cancelled download was downloaded anyway, in full, to nobody.
+#[cfg(unix)]
+#[test]
+fn test_client_abort_releases_the_target() {
+    use std::os::fd::AsRawFd;
+
+    let tunnel = start_tunnel("client_abort");
+    let (target_port, released) = spawn_endless_target();
+
+    let mut sock = socks5_connect(tunnel.proxy_port, target_port);
+
+    // Let the response get going, then abort. SO_LINGER with a zero timeout
+    // turns close() into a RST, the way a crashed or cancelled app leaves a
+    // connection.
+    let mut buf = vec![0u8; 4096];
+    let n = sock.read(&mut buf).expect("no response bytes arrived");
+    assert!(n > 0, "target sent nothing");
+    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+    unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        );
+    }
+    drop(sock);
+
+    let held_for = released
+        .recv_timeout(Duration::from_secs(40))
+        .expect("target never reported: its socket was never released");
+    assert!(
+        held_for < Duration::from_secs(10),
+        "server kept pulling the target for {:?} after the client aborted",
+        held_for
     );
 }
