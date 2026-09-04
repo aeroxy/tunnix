@@ -15,7 +15,7 @@ use std::time::Duration;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 use crate::archive::{spawn_compress, spawn_decompress};
 use crate::crypto::Crypto;
@@ -31,6 +31,12 @@ struct Session {
     /// Per-conn_id sink for client→target bytes. Covers both TCP connections and
     /// PTYs (remote exec) — a PTY is just another duplex byte stream.
     tcp_writers: HashMap<u32, mpsc::Sender<Vec<u8>>>,
+    /// Per-conn_id abort signal for TCP relays. `Message::Abort` fires it so
+    /// the relay stops pulling the target: `Close` only half-closes the upload
+    /// direction, and an abandoned download would otherwise be pulled to
+    /// completion into a conn_id the client has already forgotten. Only TCP
+    /// connections register one; PTYs and transfers have their own teardown.
+    aborts: HashMap<u32, Arc<Notify>>,
     /// Per-conn_id resize request channel for remote-exec PTYs. Senders are
     /// kept in the session so Message::Resize can deliver a new PtySize
     /// without taking the master PTY out of `relay_pty_connection`.
@@ -203,6 +209,7 @@ async fn handle_stream(session_id: &str, state: &ServerState) -> Response<BoxBod
             .or_insert_with(|| {
                 Arc::new(Mutex::new(Session {
                     tcp_writers: HashMap::new(),
+                    aborts: HashMap::new(),
                     #[cfg(unix)]
                     pty_resize: HashMap::new(),
                     sse_tx: sse_tx.clone(),
@@ -339,15 +346,17 @@ async fn handle_send(
                     let (tcp_read, tcp_write) = tcp_stream.into_split();
 
                     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+                    let abort = Arc::new(Notify::new());
                     {
                         let mut sess = session.lock().await;
                         sess.tcp_writers.insert(conn_id, write_tx);
+                        sess.aborts.insert(conn_id, abort.clone());
                     };
 
                     let crypto = hot.crypto.clone();
                     tokio::spawn(async move {
                         relay_tcp_connection(
-                            conn_id, &host, port, tcp_read, tcp_write, write_rx,
+                            conn_id, &host, port, tcp_read, tcp_write, write_rx, abort,
                             session, crypto,
                         )
                         .await;
@@ -390,6 +399,19 @@ async fn handle_send(
             info!("[{}] CLOSE", conn_id);
             let mut sess = session.lock().await;
             sess.tcp_writers.remove(&conn_id);
+            ok_response("")
+        }
+        Message::Abort { conn_id } => {
+            info!("[{}] ABORT", conn_id);
+            // The connection is dead on the client's side. Unlike Close this
+            // releases both directions: the writer so the upload side ends,
+            // and the abort signal so the read task stops pulling the target
+            // instead of streaming the rest of its response to nobody.
+            let mut sess = session.lock().await;
+            sess.tcp_writers.remove(&conn_id);
+            if let Some(abort) = sess.aborts.remove(&conn_id) {
+                abort.notify_one();
+            }
             ok_response("")
         }
         #[cfg(unix)]
@@ -589,6 +611,7 @@ async fn relay_tcp_connection(
     mut tcp_read: tokio::net::tcp::OwnedReadHalf,
     mut tcp_write: tokio::net::tcp::OwnedWriteHalf,
     mut write_rx: mpsc::Receiver<Vec<u8>>,
+    abort: Arc<Notify>,
     session: Arc<Mutex<Session>>,
     crypto: Arc<Crypto>,
 ) {
@@ -606,6 +629,10 @@ async fn relay_tcp_connection(
         let mut client_gone = false;
         // Set when the target itself failed, as opposed to closing cleanly.
         let mut read_failure: Option<String> = None;
+        // Set when the client sent Abort: the connection is dead on its side
+        // and it has already unregistered the conn_id, so there is nobody to
+        // report to and nothing left to relay.
+        let mut aborted = false;
         // A silent target gives this task nothing to react to, so a vanished
         // client would otherwise leave it blocked on read() forever, holding
         // the target socket. The delivery retries below only notice a dead
@@ -617,6 +644,11 @@ async fn relay_tcp_connection(
             let read = tokio::select! {
                 // Cancel-safe: no bytes are consumed if the other branch wins.
                 result = tcp_read.read(&mut buf) => result,
+                _ = abort.notified() => {
+                    debug!("[{}] client aborted; releasing the target", conn_id);
+                    aborted = true;
+                    break;
+                }
                 _ = &mut sse_dead => {
                     debug!("[{}] SSE closed continuously; abandoning target read", conn_id);
                     client_gone = true;
@@ -654,7 +686,13 @@ async fn relay_tcp_connection(
             }
         }
 
-        if client_gone {
+        if aborted {
+            // handle_send already removed the writer, so the write task is
+            // ending on its own. Nothing to send: the client is not listening
+            // for this conn_id any more. Idempotent in case of a race with the
+            // final cleanup below.
+            session_clone.lock().await.tcp_writers.remove(&conn_id);
+        } else if client_gone {
             // No further uploads can arrive, so drop the writer to keep
             // teardown bounded: the write task ends once its sender is gone.
             session_clone.lock().await.tcp_writers.remove(&conn_id);
@@ -772,8 +810,13 @@ async fn relay_tcp_connection(
 
     // Idempotent: the normal paths already removed the writer (client Close, or
     // the client-gone branch above). This catches a target write error, which
-    // ends the write task with the entry still registered.
-    session.lock().await.tcp_writers.remove(&conn_id);
+    // ends the write task with the entry still registered. The abort signal
+    // goes too; nothing can fire it usefully once the relay is gone.
+    {
+        let mut sess = session.lock().await;
+        sess.tcp_writers.remove(&conn_id);
+        sess.aborts.remove(&conn_id);
+    }
 
     info!("[{}] Connection closed for {}:{}", conn_id, host, port);
 }
@@ -1295,6 +1338,7 @@ mod tests {
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
         let session = Arc::new(Mutex::new(Session {
             tcp_writers: HashMap::new(),
+            aborts: HashMap::new(),
             #[cfg(unix)]
             pty_resize: HashMap::new(),
             sse_tx,
@@ -1310,6 +1354,7 @@ mod tests {
             tcp_read,
             tcp_write,
             write_rx,
+            Arc::new(Notify::new()),
             session.clone(),
             crypto.clone(),
         ));
@@ -1357,6 +1402,7 @@ mod tests {
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
         let session = Arc::new(Mutex::new(Session {
             tcp_writers: HashMap::new(),
+            aborts: HashMap::new(),
             #[cfg(unix)]
             pty_resize: HashMap::new(),
             sse_tx,
@@ -1374,6 +1420,7 @@ mod tests {
             tcp_read,
             tcp_write,
             write_rx,
+            Arc::new(Notify::new()),
             session.clone(),
             crypto,
         ));
@@ -1420,6 +1467,7 @@ mod tests {
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
         let session = Arc::new(Mutex::new(Session {
             tcp_writers: HashMap::new(),
+            aborts: HashMap::new(),
             #[cfg(unix)]
             pty_resize: HashMap::new(),
             sse_tx,
@@ -1435,6 +1483,7 @@ mod tests {
             tcp_read,
             tcp_write,
             write_rx,
+            Arc::new(Notify::new()),
             session.clone(),
             crypto.clone(),
         ));
@@ -1496,6 +1545,7 @@ mod tests {
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
         let session = Arc::new(Mutex::new(Session {
             tcp_writers: HashMap::new(),
+            aborts: HashMap::new(),
             #[cfg(unix)]
             pty_resize: HashMap::new(),
             sse_tx,
@@ -1511,6 +1561,7 @@ mod tests {
             tcp_read,
             tcp_write,
             write_rx,
+            Arc::new(Notify::new()),
             session.clone(),
             crypto,
         ));
@@ -1552,6 +1603,7 @@ mod tests {
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
         let session = Arc::new(Mutex::new(Session {
             tcp_writers: HashMap::new(),
+            aborts: HashMap::new(),
             #[cfg(unix)]
             pty_resize: HashMap::new(),
             sse_tx: old_tx,
@@ -1566,6 +1618,7 @@ mod tests {
             tcp_read,
             tcp_write,
             write_rx,
+            Arc::new(Notify::new()),
             session.clone(),
             crypto.clone(),
         ));
@@ -1600,6 +1653,7 @@ mod tests {
         let (sse_tx, _sse_rx) = mpsc::channel::<Vec<u8>>(16);
         let session = Arc::new(Mutex::new(Session {
             tcp_writers: HashMap::new(),
+            aborts: HashMap::new(),
             #[cfg(unix)]
             pty_resize: HashMap::new(),
             sse_tx,
@@ -1628,4 +1682,83 @@ mod tests {
             .expect("watchdog stranded the session lock: every send_to_client would park here");
         drop(regained);
     }
+
+    /// `Message::Abort` must release the target entirely, not just the upload
+    /// direction. `Close` deliberately keeps the read task pulling the target's
+    /// output - the half-close an app that finished sending relies on - so a
+    /// client whose app *aborted* used to leave this relay streaming the whole
+    /// remaining response into a conn_id the client had already forgotten.
+    /// Real time: nothing here waits on a timer, and the SSE receiver is
+    /// drained so every delivery succeeds on its first attempt.
+    #[tokio::test]
+    async fn an_abort_releases_a_target_that_is_still_sending() {
+        const CONN_ID: u32 = 47;
+
+        // Target that streams until its socket fails, and reports when it did.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = target.accept().await else { return };
+            let chunk = vec![7u8; 65536];
+            while sock.write_all(&chunk).await.is_ok() {}
+            let _ = closed_tx.send(());
+        });
+
+        let stream = TcpStream::connect(target_addr).await.unwrap();
+        let (tcp_read, tcp_write) = stream.into_split();
+
+        // A healthy, draining client, so the response is flowing when the
+        // abort lands and nothing else could end the read task.
+        let (sse_tx, mut sse_rx) = mpsc::channel::<Vec<u8>>(16);
+        tokio::spawn(async move { while sse_rx.recv().await.is_some() {} });
+
+        let crypto = Arc::new(Crypto::new("test-password").unwrap());
+        let abort = Arc::new(Notify::new());
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            aborts: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }));
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
+        {
+            let mut sess = session.lock().await;
+            sess.tcp_writers.insert(CONN_ID, write_tx);
+            sess.aborts.insert(CONN_ID, abort.clone());
+        }
+
+        let relay = tokio::spawn(relay_tcp_connection(
+            CONN_ID,
+            "127.0.0.1",
+            target_addr.port(),
+            tcp_read,
+            tcp_write,
+            write_rx,
+            abort,
+            session.clone(),
+            crypto,
+        ));
+
+        // Let the response get going, then abort exactly as handle_send does.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!relay.is_finished(), "relay ended before the abort");
+        {
+            let mut sess = session.lock().await;
+            sess.tcp_writers.remove(&CONN_ID);
+            sess.aborts.remove(&CONN_ID).expect("abort signal was registered").notify_one();
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("relay kept pulling the target after the client aborted")
+            .expect("relay task panicked");
+        tokio::time::timeout(Duration::from_secs(10), closed_rx)
+            .await
+            .expect("target socket was not released by the abort")
+            .unwrap();
+        assert!(session.lock().await.aborts.is_empty(), "abort signal should be cleaned up");
+    }
+
 }

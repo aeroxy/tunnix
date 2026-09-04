@@ -1,9 +1,9 @@
 use crate::tunnel::{Tunnel, TunnelEvent};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error};
 use crate::protocol::Message;
 
@@ -11,6 +11,36 @@ static CONN_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 pub fn next_conn_id() -> u32 {
     CONN_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// How the read half's loop ended.
+enum Upload {
+    /// The app closed its side; nothing more will be sent.
+    Eof,
+    /// The app's socket or the tunnel failed. The connection is dead.
+    Failed,
+    /// The write half stopped us because the connection failed.
+    Stopped(Stop),
+}
+
+/// What the read half tells the write half once the upload side is done.
+enum UploadEnd {
+    /// Clean: the app is finished sending. No failure report can follow from
+    /// this direction, so the write half may exit once the response is closed.
+    Eof,
+    /// The upload side itself broke. The write half must fail the connection
+    /// now rather than wait for a terminal event that cannot arrive.
+    Failed,
+}
+
+/// Why the write half is stopping the read half, so it knows whether the
+/// server still needs to be told.
+enum Stop {
+    /// The server reported the failure itself, so it has already released the
+    /// target.
+    ServerReported,
+    /// The failure is local to this client; the server has heard nothing.
+    Local,
 }
 
 /// Bidirectional relay between a TCP stream and the tunnel.
@@ -24,54 +54,36 @@ pub async fn relay(
     let (mut tcp_read, mut tcp_write) = stream.into_split();
     let tunnel_clone = tunnel.clone();
 
-    // Raised by the write half when the connection has failed. The read half
+    // The two halves coordinate over two one-shot signals, each carrying its
+    // reason, so neither side has to infer state the other already knows.
+    //
+    // Read half -> write half: how the upload side ended. After the app's EOF
+    // the write half deliberately keeps going: the target closing its output
+    // says nothing about the app's upload, and the reverse holds too, so this
+    // relay ends only when *both* directions are done. An app that holds a
+    // half-closed connection open forever keeps its conn_id registered here
+    // and its target socket held on the server - correct for TCP, but note
+    // that neither side applies an idle timeout, so "forever" is literal.
+    let (upload_tx, mut upload_rx) = oneshot::channel::<UploadEnd>();
+    // Write half -> read half: stop, the connection has failed. The read half
     // has to stop cooperatively rather than being aborted: aborting would drop
     // its socket half, and both halves are needed to abort the connection.
-    //
-    // Only failures raise it. After a clean Close the read half deliberately
-    // stays open: the target closing its output says nothing about the app's
-    // upload, which the server still accepts, so this relay ends when the app
-    // closes its own side. An app that holds a half-closed connection open
-    // forever keeps its conn_id registered - correct for TCP, and bounded in
-    // practice by the app being a local process rather than a remote peer.
-    let failed = Arc::new(Notify::new());
-    let failed_read = failed.clone();
-    // Whether that failure was the server's own report. It has then already
-    // released the target writer, so the Close below would be redundant.
-    let server_reported = Arc::new(AtomicBool::new(false));
-    let server_reported_read = server_reported.clone();
-    // Raised by the read half once the upload side is done, so the write half
-    // knows no further failure report can arrive.
-    let upload_done = Arc::new(Notify::new());
-    let upload_done_write = upload_done.clone();
-    // Raised instead when the upload side ended in failure rather than at the
-    // app's EOF. The write half has to hear that unconditionally: a broken
-    // tunnel produces no events at all, so waiting for a terminal one that
-    // cannot arrive would park this relay - and the app with it - indefinitely.
-    let upload_failed = Arc::new(Notify::new());
-    let upload_failed_write = upload_failed.clone();
+    let (stop_tx, mut stop_rx) = oneshot::channel::<Stop>();
 
     let read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 32768];
-        // Set when the write half stopped us because the connection failed.
-        // Says nothing about *whose* failure it was - `server_reported` is the
-        // flag that means the server reported it.
-        let mut stopped_by_write_half = false;
-        // Set when the upload side itself broke - the app's socket errored, or
-        // the tunnel would not take the chunk. Either way this connection is
-        // dead, as opposed to the app simply being done sending.
-        let mut local_failure = false;
-        loop {
+        let outcome = loop {
             let read = tokio::select! {
-                // Biased toward the failure signal: once the connection has
-                // failed, every further chunk costs another send_message on the
-                // tunnel that just broke, and an unbiased poll can keep picking
-                // the read for as long as the app has bytes buffered.
+                // Biased toward the stop signal: once the connection has
+                // failed, every further chunk costs another send_message on
+                // the tunnel that just broke, and an unbiased poll can keep
+                // picking the read for as long as the app has bytes buffered.
                 biased;
-                _ = failed_read.notified() => {
+                stop = &mut stop_rx => {
                     debug!("[{}] connection failed; stopping the upload side", conn_id);
-                    stopped_by_write_half = true;
-                    break;
+                    // Err means the write half went away without saying why
+                    // (it panicked). The server has heard nothing either way.
+                    break Upload::Stopped(stop.unwrap_or(Stop::Local));
                 }
                 // Cancel-safe: no bytes are consumed if the other branch wins.
                 result = tcp_read.read(&mut buf) => result,
@@ -79,7 +91,7 @@ pub async fn relay(
             match read {
                 Ok(0) => {
                     debug!("[{}] client EOF", conn_id);
-                    break;
+                    break Upload::Eof;
                 }
                 Ok(n) => {
                     debug!("[{}] client -> tunnel {} bytes", conn_id, n);
@@ -89,72 +101,77 @@ pub async fn relay(
                     };
                     if let Err(e) = tunnel_clone.send_message(&msg).await {
                         error!("[{}] tunnel send error: {}", conn_id, e);
-                        local_failure = true;
-                        break;
+                        break Upload::Failed;
                     }
                 }
                 Err(e) => {
                     debug!("[{}] client read error: {}", conn_id, e);
-                    local_failure = true;
-                    break;
+                    break Upload::Failed;
                 }
             }
-        }
-        // Tell the server we are done sending. It drops the target's write
-        // half, so the target sees a real FIN — the half-close signal some
-        // protocols need to start replying. Deliberately *not* unregistering
-        // the conn_id here: the target may still be streaming a response, and
-        // dropping the dispatch channel now would discard it.
-        //
-        // Sent on local failures too, not just clean EOF: only the server can
-        // release the target writer, and when the failure is ours it has heard
-        // nothing — its SSE watchdog cannot help while our stream is still
-        // alive, so without this the writer is held indefinitely. Skipped only
-        // when the server itself reported the failure, having already released
-        // the writer: the POST would be redundant, and on a broken tunnel it
-        // costs a full reconnect wait before failing anyway.
-        let aborting = stopped_by_write_half || local_failure;
-        if !(stopped_by_write_half && server_reported_read.load(Ordering::SeqCst)) {
-            let close_msg = Message::Close { conn_id };
-            if aborting {
-                // This connection is about to be aborted, and the app is
-                // waiting on a response that will never arrive - it has to find
-                // that out now. send_message can spend a full RECONNECT_WAIT on
-                // the very tunnel whose failure got us here, so it must not sit
-                // between the failure and the RST below. The server still needs
-                // the Close to release the target writer, so hand it off rather
-                // than drop it.
+        };
+
+        // Tell the server how this side ended. Deliberately *not*
+        // unregistering the conn_id here: the target may still be streaming a
+        // response, and dropping the dispatch channel now would discard it.
+        match outcome {
+            // The server reported the failure itself, so it has already
+            // released the target. Another POST would be redundant, and on a
+            // broken tunnel it costs a full reconnect wait before failing.
+            Upload::Stopped(Stop::ServerReported) => {}
+            // Close: we are done sending. The server drops the target's write
+            // half, so the target sees a real FIN - the half-close signal some
+            // protocols need to start replying - and keeps its read half, so
+            // the response still flows.
+            Upload::Eof => {
+                let _ = tunnel_clone.send_message(&Message::Close { conn_id }).await;
+            }
+            // Abort: this connection is dead on our side. Close would only
+            // half-close it, and the server would keep pulling the target's
+            // response into a conn_id we are about to unregister - for an
+            // abandoned download, all the way to the end. Abort releases the
+            // target entirely.
+            //
+            // Sent on a detached task: the app is waiting on a response that
+            // will never arrive and has to find that out now, but send_message
+            // can spend a full RECONNECT_WAIT on the very tunnel whose failure
+            // got us here, so it must not sit between the failure and the RST
+            // below. The server still needs to hear it, so hand it off rather
+            // than drop it.
+            Upload::Failed | Upload::Stopped(Stop::Local) => {
                 tokio::spawn(async move {
-                    let _ = tunnel_clone.send_message(&close_msg).await;
+                    let _ = tunnel_clone.send_message(&Message::Abort { conn_id }).await;
                 });
-            } else {
-                let _ = tunnel_clone.send_message(&close_msg).await;
             }
         }
 
-        // Let the write half stop waiting: cleanly if the app just finished
-        // sending, as a failure if the upload broke.
-        if local_failure {
-            upload_failed.notify_one();
-        } else {
-            upload_done.notify_one();
-        }
+        // Let the write half stop waiting. Only a failure of the upload side
+        // itself is reported as one: a stop came *from* the write half, which
+        // is already gone.
+        let _ = upload_tx.send(match outcome {
+            Upload::Failed => UploadEnd::Failed,
+            Upload::Eof | Upload::Stopped(_) => UploadEnd::Eof,
+        });
         tcp_read
     });
 
-    let failed_notify = failed;
     let write_task = tokio::spawn(async move {
         // A clean end-of-stream is only ever earned by an explicit terminal
         // event. Anything else that ends this loop leaves the connection
         // broken, and handing that to the app as a successful EOF is the
         // silent corruption this relay exists to avoid.
-        let mut channel_dropped = false;
         let mut failed = false;
+        // Whether that failure was the server's own report: it has then
+        // already released the target, and the read half need not tell it.
+        let mut server_reported = false;
         // Set once the response direction has closed cleanly. The upload can
         // still fail on the target after that, and the server reports it as a
         // late Error, so this half keeps draining until the upload side is
         // done rather than exiting on Close and losing that report.
         let mut response_closed = false;
+        // Set once the read half has reported the upload's end. Its one-shot
+        // is consumed at that point, so this also retires its select branch.
+        let mut upload_ended = false;
         loop {
             let event = tokio::select! {
                 // Biased so queued events are always drained before the exit
@@ -163,18 +180,40 @@ pub async fn relay(
                 received = event_rx.recv() => match received {
                     Some(event) => event,
                     None => {
-                        channel_dropped = true;
+                        // The server session was reset, or the dispatcher
+                        // dropped this connection as stalled. Before Close
+                        // that truncates the response. After Close the
+                        // response is complete, but an upload still in
+                        // progress now lands on a server that no longer knows
+                        // this conn_id and discards it with a 200 - so the
+                        // upload has to stop, even though the response
+                        // direction was fine.
+                        debug!("[{}] dispatch channel dropped before the connection finished", conn_id);
+                        failed = true;
                         break;
                     }
                 },
-                _ = upload_failed_write.notified() => {
-                    debug!("[{}] upload side failed; failing the connection", conn_id);
-                    failed = true;
-                    break;
-                }
-                _ = upload_done_write.notified(), if response_closed => {
-                    debug!("[{}] upload finished; nothing left to report", conn_id);
-                    break;
+                upload = &mut upload_rx, if !upload_ended => {
+                    upload_ended = true;
+                    match upload {
+                        Ok(UploadEnd::Eof) if response_closed => {
+                            debug!("[{}] upload finished; nothing left to report", conn_id);
+                            break;
+                        }
+                        // The response is still open: keep draining it. No
+                        // failure report can follow from the upload side now.
+                        Ok(UploadEnd::Eof) => continue,
+                        // The upload side broke - or the read half is gone
+                        // without a report, which is a panic. A broken tunnel
+                        // produces no events at all, so waiting for a terminal
+                        // one that cannot arrive would park this relay, and
+                        // the app with it, indefinitely.
+                        Ok(UploadEnd::Failed) | Err(_) => {
+                            debug!("[{}] upload side failed; failing the connection", conn_id);
+                            failed = true;
+                            break;
+                        }
+                    }
                 }
             };
             match event {
@@ -193,39 +232,37 @@ pub async fn relay(
                     debug!("[{}] tunnel closed", conn_id);
                     response_closed = true;
                     // Everything arrived: FIN, so the app reads a clean EOF.
-                    // Not breaking here - the upload may still fail, and the
-                    // app has to hear about it.
                     let _ = tcp_write.shutdown().await;
+                    // Not done yet unless the upload side already is - it may
+                    // still fail on the target, and the app has to hear about
+                    // it.
+                    if upload_ended {
+                        break;
+                    }
                 }
                 TunnelEvent::Error(msg) => {
                     debug!("[{}] tunnel error: {}", conn_id, msg);
                     failed = true;
-                    server_reported.store(true, Ordering::SeqCst);
+                    server_reported = true;
                     break;
                 }
                 TunnelEvent::Exit(_) => {
-                    // Only meaningful for remote exec; a TCP relay never sees it.
+                    // Only meaningful for remote exec; a TCP relay never sees
+                    // it. If one arrives anyway the response direction has
+                    // ended without a Close, so fail the connection rather
+                    // than leave the read half parked with nothing to stop it.
+                    debug!("[{}] unexpected exit status on a TCP relay", conn_id);
+                    failed = true;
                     break;
                 }
             }
         }
 
-        // The channel was dropped before the upload finished: the server
-        // session was reset, or the dispatcher dropped this connection as
-        // stalled. Before Close that truncates the response, and the app must
-        // not read it as a successful end-of-stream. After Close the response
-        // is complete, but an upload still in progress now lands on a server
-        // that no longer knows this conn_id and discards it with a 200 - so the
-        // upload has to stop, even though the response direction was fine.
-        if channel_dropped {
-            debug!("[{}] dispatch channel dropped before the connection finished", conn_id);
-            failed = true;
-        }
         if failed {
             // Release the read half so the connection can be aborted: the app
             // is waiting on a response that will never arrive, so it will not
             // close its side on its own.
-            failed_notify.notify_one();
+            let _ = stop_tx.send(if server_reported { Stop::ServerReported } else { Stop::Local });
         }
         // Abort only when the response was *not* already delivered in full.
         // Once Close has been forwarded the app has every byte and a FIN;
