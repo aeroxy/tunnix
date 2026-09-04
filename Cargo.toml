@@ -29,8 +29,10 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-# 1.51: TcpStream::set_zero_linger, used by the relay to abort a failed
-# connection with a RST instead of a FIN the app would read as a clean EOF.
+# TcpStream::set_zero_linger (added in tokio 1.50) lets the relay abort a
+# failed connection with a RST instead of a FIN the app would read as a clean
+# EOF. The floor is kept at 1.51, the version this is actually built and
+# tested against; 1.50 would satisfy the API alone.
 tokio = { version = "1.51", features = ["full"] }
 rustls = { version = "0.23", features = ["ring"] }
 

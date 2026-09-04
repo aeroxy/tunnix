@@ -5,6 +5,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod common;
+use crate::common::no_inherited_proxy;
+
 fn find_free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind");
     listener.local_addr().unwrap().port()
@@ -42,15 +45,6 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Everything here talks over loopback, so an ambient proxy in the developer's
-/// environment must not be inherited: the HTTP client honours `*_PROXY` and
-/// would try to reach 127.0.0.1 through it.
-fn no_inherited_proxy(cmd: &mut Command) {
-    for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
-        cmd.env_remove(var);
-    }
-}
-
 /// Write an empty config for a spawned process to use. Without `--config` the
 /// binary falls back to ./config.toml and then ~/.config/tunnix/config.toml, so
 /// a developer's own `allow_transfer = true` would silently decide what these
@@ -64,9 +58,9 @@ fn write_empty_config(tmp: &Path, name: &str, section: &str) -> std::path::PathB
 fn start_server(bin: &str, tmp: &Path, port: u16, allow_transfer: bool) -> KillOnDrop {
     let config = write_empty_config(tmp, "server.toml", "server");
     let mut args = vec![
+        "server".to_string(),
         "--config".to_string(),
         config.to_str().unwrap().to_string(),
-        "server".to_string(),
         "--listen".to_string(),
         format!("127.0.0.1:{}", port),
         "-p".to_string(),
@@ -91,9 +85,9 @@ fn start_server(bin: &str, tmp: &Path, port: u16, allow_transfer: bool) -> KillO
 fn run_transfer(bin: &str, tmp: &Path, port: u16, sub: &str, paths: &[&str]) -> bool {
     let config = write_empty_config(tmp, "client.toml", "client");
     let mut args = vec![
+        sub.to_string(),
         "--config".to_string(),
         config.to_str().unwrap().to_string(),
-        sub.to_string(),
         "-s".to_string(),
         format!("http://127.0.0.1:{}", port),
         "-p".to_string(),

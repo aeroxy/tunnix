@@ -1319,6 +1319,18 @@ async fn relay_push(
 mod tests {
     use super::*;
 
+    /// Build a `Session` for a test. Centralised so that adding a field is one
+    /// edit here rather than one in every test - as adding `aborts` was.
+    fn test_session(sse_tx: mpsc::Sender<Vec<u8>>) -> Arc<Mutex<Session>> {
+        Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            aborts: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }))
+    }
+
     /// A terminal `Close` must survive an SSE queue that is momentarily full.
     /// The relay used to make a single 500ms attempt and give up, so a client
     /// that stalled (or was mid-reconnect) never learned the target closed and
@@ -1345,13 +1357,7 @@ mod tests {
         sse_tx.send(b"already queued".to_vec()).await.unwrap();
 
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
-        let session = Arc::new(Mutex::new(Session {
-            tcp_writers: HashMap::new(),
-            aborts: HashMap::new(),
-            #[cfg(unix)]
-            pty_resize: HashMap::new(),
-            sse_tx,
-        }));
+        let session = test_session(sse_tx);
 
         // Keep the writer alive so only the read half drives teardown.
         let (_write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
@@ -1409,13 +1415,7 @@ mod tests {
         drop(sse_rx);
 
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
-        let session = Arc::new(Mutex::new(Session {
-            tcp_writers: HashMap::new(),
-            aborts: HashMap::new(),
-            #[cfg(unix)]
-            pty_resize: HashMap::new(),
-            sse_tx,
-        }));
+        let session = test_session(sse_tx);
 
         // Registered writer, held open the way a live client's would be: only
         // the client's Close would normally remove it, and it never arrives.
@@ -1474,13 +1474,7 @@ mod tests {
         let (sse_tx, mut sse_rx) = mpsc::channel::<Vec<u8>>(16);
 
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
-        let session = Arc::new(Mutex::new(Session {
-            tcp_writers: HashMap::new(),
-            aborts: HashMap::new(),
-            #[cfg(unix)]
-            pty_resize: HashMap::new(),
-            sse_tx,
-        }));
+        let session = test_session(sse_tx);
 
         let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
         session.lock().await.tcp_writers.insert(CONN_ID, write_tx);
@@ -1552,13 +1546,7 @@ mod tests {
         drop(sse_rx);
 
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
-        let session = Arc::new(Mutex::new(Session {
-            tcp_writers: HashMap::new(),
-            aborts: HashMap::new(),
-            #[cfg(unix)]
-            pty_resize: HashMap::new(),
-            sse_tx,
-        }));
+        let session = test_session(sse_tx);
 
         let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
         session.lock().await.tcp_writers.insert(CONN_ID, write_tx);
@@ -1610,13 +1598,7 @@ mod tests {
         old_tx.send(b"stale".to_vec()).await.unwrap();
 
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
-        let session = Arc::new(Mutex::new(Session {
-            tcp_writers: HashMap::new(),
-            aborts: HashMap::new(),
-            #[cfg(unix)]
-            pty_resize: HashMap::new(),
-            sse_tx: old_tx,
-        }));
+        let session = test_session(old_tx);
 
         let (_write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
 
@@ -1660,13 +1642,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_sse_watchdog_never_strands_the_session_lock() {
         let (sse_tx, _sse_rx) = mpsc::channel::<Vec<u8>>(16);
-        let session = Arc::new(Mutex::new(Session {
-            tcp_writers: HashMap::new(),
-            aborts: HashMap::new(),
-            #[cfg(unix)]
-            pty_resize: HashMap::new(),
-            sse_tx,
-        }));
+        let session = test_session(sse_tx);
 
         // Someone else holds the lock, as `handle_send` briefly does for every
         // uploaded chunk.
@@ -1724,13 +1700,7 @@ mod tests {
 
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
         let abort = Arc::new(Notify::new());
-        let session = Arc::new(Mutex::new(Session {
-            tcp_writers: HashMap::new(),
-            aborts: HashMap::new(),
-            #[cfg(unix)]
-            pty_resize: HashMap::new(),
-            sse_tx,
-        }));
+        let session = test_session(sse_tx);
         let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
         {
             let mut sess = session.lock().await;
@@ -1799,13 +1769,7 @@ mod tests {
         drop(sse_rx);
 
         let crypto = Arc::new(Crypto::new("test-password").unwrap());
-        let session = Arc::new(Mutex::new(Session {
-            tcp_writers: HashMap::new(),
-            aborts: HashMap::new(),
-            #[cfg(unix)]
-            pty_resize: HashMap::new(),
-            sse_tx,
-        }));
+        let session = test_session(sse_tx);
         let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
         session.lock().await.tcp_writers.insert(CONN_ID, write_tx);
 
