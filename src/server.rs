@@ -729,13 +729,16 @@ async fn relay_tcp_connection(
             // The client's relay ends its response direction on this message,
             // so it has to arrive: retry across a reconnect instead of making a
             // single attempt that a momentarily-full queue would defeat.
-            if send_to_client(conn_id, &terminal, &crypto_clone, &session_clone).await {
-                // Deliberately keeping the writer registered: the target
-                // closing its output says nothing about the client's upload,
-                // which may still be in flight. handle_send drops the writer
-                // when the client's own Close arrives, and that is what shuts
-                // the target's write side down.
-            } else {
+            //
+            // On success the writer is deliberately kept registered: the
+            // target closing its output says nothing about the client's
+            // upload, which may still be in flight. handle_send drops the
+            // writer when the client's own Close (or Abort) arrives, and that
+            // is what shuts the target's write side down. Until then this
+            // relay holds the target socket, and there is no idle timeout on
+            // either side: an app that never closes its half-open connection
+            // holds a target socket here for as long as the client runs.
+            if !send_to_client(conn_id, &terminal, &crypto_clone, &session_clone).await {
                 // The client exhausted the delivery budget, so its Close is
                 // not coming either. Release the writer now instead of leaving
                 // the write task to wait on the SSE watchdog, which never
@@ -920,7 +923,9 @@ async fn relay_pty_connection(
                 }) {
                     Ok(Ok(0)) => break, // EOF: slave fully closed
                     Ok(Ok(n)) => {
-                        if !forward_pty_chunk(conn_id, buf[..n].to_vec(), &crypto_fwd, &session_fwd).await {
+                        let msg = Message::Data { conn_id, data: buf[..n].to_vec() };
+                        if !send_to_client(conn_id, &msg, &crypto_fwd, &session_fwd).await {
+                            error!("[{}] SSE reconnect timed out; dropping PTY output", conn_id);
                             break;
                         }
                     }
@@ -984,8 +989,8 @@ async fn relay_pty_connection(
     // Watchdog: an abrupt client disconnect (network drop, process killed)
     // leaves write_tx in tcp_writers, so write_blocking never finishes and the
     // child runs forever. Probe the session's sse_tx; only kill the child if
-    // SSE has been continuously closed for at least 6s, so transient drops
-    // (e.g., a client reconnect within forward_pty_chunk's 5s retry window)
+    // SSE has been continuously closed for SSE_DEAD_GRACE, so transient drops
+    // (e.g., a client reconnect within send_to_client's retry window)
     // don't kill an otherwise-healthy session.
     let sse_dead = await_sse_dead(session.clone());
     // Pin to the stack so we can re-poll across loop iterations; the async
@@ -1043,7 +1048,7 @@ async fn relay_pty_connection(
         Message::Close { conn_id },
     ] {
         // When the client is already known gone (writer closed, or SSE dead
-        // ≥6s past the reconnect window) one best-effort attempt is enough:
+        // for SSE_DEAD_GRACE) one best-effort attempt is enough:
         // spending the full budget only delays teardown to rediscover that.
         let attempts = if client_gone { 1 } else { SEND_ATTEMPTS };
         let sent = send_to_client_with_attempts(conn_id, &msg, &crypto, &session, attempts).await;
@@ -1069,28 +1074,21 @@ async fn relay_pty_connection(
     info!("[{}] PTY session closed (exit {})", conn_id, code);
 }
 
-/// Encrypt one PTY chunk and push it to the (possibly-reconnected) SSE sender.
-/// Retries briefly across a client reconnect so a transient SSE drop doesn't
-/// lose output. Returns false if the chunk could not be delivered.
-#[cfg(unix)]
-async fn forward_pty_chunk(
-    conn_id: u32,
-    data: Vec<u8>,
-    crypto: &Crypto,
-    session: &Arc<Mutex<Session>>,
-) -> bool {
-    let msg = Message::Data { conn_id, data };
-    if send_to_client(conn_id, &msg, crypto, session).await {
-        return true;
-    }
-    error!("[{}] SSE reconnect timed out; dropping PTY output", conn_id);
-    false
-}
-
 /// How long a session's SSE stream must stay continuously closed before its
-/// relays treat the client as gone. Long enough that a client reconnecting
-/// inside the send retry window doesn't count as a disconnect.
-const SSE_DEAD_GRACE: Duration = Duration::from_secs(6);
+/// relays treat the client as gone.
+///
+/// A trade between two costs. Too short, and a client that is merely slow to
+/// reconnect loses its idle connections: its reconnect is a fixed 3s sleep
+/// plus a GET that can take several seconds through a reverse proxy, and 6s
+/// cleared the sleep with little to spare. Too long, and a client that really
+/// is gone keeps its PTY children running and its target sockets held for the
+/// whole wait. 10s leaves the GET 7s and still reaps within seconds.
+///
+/// Deliberately shorter than the 30s `send_to_client` budget, so an idle
+/// connection gives up on a vanished client sooner than an active one: the
+/// active one is at least still moving bytes for that budget, while the idle
+/// one is only holding resources.
+const SSE_DEAD_GRACE: Duration = Duration::from_secs(10);
 
 /// Resolves once this session's SSE stream has been closed continuously for
 /// `SSE_DEAD_GRACE`.
@@ -1131,16 +1129,17 @@ async fn await_sse_dead(session: Arc<Mutex<Session>>) {
 
 /// Encrypt `msg` and push it to the (possibly-reconnected) SSE sender, retrying
 /// briefly across a client reconnect. Returns false if it could not be
-/// delivered. Cross-platform sibling of `forward_pty_chunk`; used by TCP
-/// relays, PTY teardown and transfers. Terminal messages (`Close`, `Error`,
+/// delivered. Used by TCP relays, PTY output and teardown, and transfers. Terminal messages (`Close`, `Error`,
 /// `ExitStatus`) must go through here: a single send loses them whenever the
 /// client's queue is momentarily full or its SSE stream is being replaced.
 ///
-/// The budget here (50 x (500ms + 100ms) ~= 30s) is what declares a client
-/// unreachable, so it must stay well above the client's `DISPATCH_STALL_TIMEOUT`
-/// in tunnel.rs. That timeout is how long one stalled consumer can keep the
-/// client from reading the SSE socket; if the two were the same magnitude, that
-/// stall alone would exhaust this budget and tear down healthy connections.
+/// The budget here (`SEND_ATTEMPTS` x `SEND_ATTEMPT_INTERVAL` = 30s of wall
+/// clock) is what declares a client unreachable, so two other constants are
+/// sized against it. It must stay well above the client's
+/// `DISPATCH_STALL_TIMEOUT` in tunnel.rs: that is how long one stalled consumer
+/// can keep the client from reading the SSE socket, and at the same magnitude
+/// that stall alone would exhaust this budget and tear down healthy
+/// connections. `SSE_DEAD_GRACE` is deliberately shorter - see its note.
 async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &Arc<Mutex<Session>>) -> bool {
     send_to_client_with_attempts(conn_id, msg, crypto, session, SEND_ATTEMPTS).await
 }
@@ -1149,6 +1148,13 @@ async fn send_to_client(conn_id: u32, msg: &Message, crypto: &Crypto, session: &
 /// unreachable. See the note on that function for why the resulting budget has
 /// to stay well above the client's `DISPATCH_STALL_TIMEOUT`.
 const SEND_ATTEMPTS: u32 = 50;
+/// Wall-clock spacing of those attempts. Each attempt is paced to this rather
+/// than to a fixed backoff: a *full* channel (client stalled) costs the 500ms
+/// send timeout, but a *closed* one (client mid-reconnect) fails instantly, and
+/// pacing by attempt count alone gave a reconnecting client 50 x 100ms = 5s
+/// against a stalled client's 30s. The client's reconnect is a 3s sleep plus a
+/// GET, so 5s was tearing down healthy connections across ordinary reconnects.
+const SEND_ATTEMPT_INTERVAL: Duration = Duration::from_millis(600);
 
 /// `send_to_client` with an explicit attempt budget. Only teardown paths that
 /// already know the client is gone should pass anything but `SEND_ATTEMPTS`:
@@ -1170,6 +1176,7 @@ async fn send_to_client_with_attempts(
         Err(e) => { error!("[{}] encrypt: {}", conn_id, e); return false; }
     };
     for attempt in 0..attempts {
+        let started = tokio::time::Instant::now();
         let sse_tx = {
             let sess = session.lock().await;
             sess.sse_tx.clone()
@@ -1185,9 +1192,11 @@ async fn send_to_client_with_attempts(
         }
         // Space out retries only when there is another one coming: a caller
         // that already knows the client is gone spends one attempt, and should
-        // not pay a backoff on its way to giving up.
+        // not pay a backoff on its way to giving up. Paced to the interval by
+        // wall clock, so a closed channel's instant failure and a full
+        // channel's 500ms timeout both spend the same budget.
         if attempt + 1 < attempts {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(SEND_ATTEMPT_INTERVAL.saturating_sub(started.elapsed())).await;
         }
     }
     false
@@ -1761,4 +1770,85 @@ mod tests {
         assert!(session.lock().await.aborts.is_empty(), "abort signal should be cleaned up");
     }
 
+    /// The mirror of the give-up tests: a client that reconnects *inside* the
+    /// grace must not lose its connections, even if its stream drops again
+    /// later. Every other watchdog test proves the bound fires; this one pins
+    /// that it counts *continuously* closed time - two closed stretches with a
+    /// reconnect between them must not add up, however long they total - and
+    /// then that it still fires once the stream really does stay down. Time is
+    /// paused, so the grace elapses without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_inside_the_grace_does_not_tear_down() {
+        const CONN_ID: u32 = 48;
+
+        // Silent target, held open: nothing but the watchdog could end the
+        // read side, and nothing but the watchdog could end the write side.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let accepted = target.accept().await;
+            std::future::pending::<()>().await;
+            drop(accepted);
+        });
+
+        let stream = TcpStream::connect(target_addr).await.unwrap();
+        let (tcp_read, tcp_write) = stream.into_split();
+
+        // The client's stream drops at t=0.
+        let (sse_tx, sse_rx) = mpsc::channel::<Vec<u8>>(16);
+        drop(sse_rx);
+
+        let crypto = Arc::new(Crypto::new("test-password").unwrap());
+        let session = Arc::new(Mutex::new(Session {
+            tcp_writers: HashMap::new(),
+            aborts: HashMap::new(),
+            #[cfg(unix)]
+            pty_resize: HashMap::new(),
+            sse_tx,
+        }));
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
+        session.lock().await.tcp_writers.insert(CONN_ID, write_tx);
+
+        let relay = tokio::spawn(relay_tcp_connection(
+            CONN_ID,
+            "127.0.0.1",
+            target_addr.port(),
+            tcp_read,
+            tcp_write,
+            write_rx,
+            Arc::new(Notify::new()),
+            session.clone(),
+            crypto,
+        ));
+
+        // Most of the grace passes with the stream closed...
+        tokio::time::sleep(SSE_DEAD_GRACE - Duration::from_secs(2)).await;
+        assert!(!relay.is_finished(), "relay gave up before the grace elapsed");
+
+        // ...then the client reconnects: handle_stream swaps in a live sender,
+        // and the watchdog gets a few ticks to see it.
+        let (live_tx, live_rx) = mpsc::channel::<Vec<u8>>(16);
+        session.lock().await.sse_tx = live_tx;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // The stream drops again for most of another grace. Total closed time
+        // is now well past the grace; continuous closed time is not.
+        drop(live_rx);
+        tokio::time::sleep(SSE_DEAD_GRACE - Duration::from_secs(2)).await;
+        assert!(
+            !relay.is_finished(),
+            "two closed stretches with a reconnect between them were added up"
+        );
+        assert!(
+            session.lock().await.tcp_writers.contains_key(&CONN_ID),
+            "writer should still be registered for a client that reconnected"
+        );
+
+        // Left down for good, it does fire: the watchdog was live all along.
+        tokio::time::timeout(Duration::from_secs(600), relay)
+            .await
+            .expect("stream stayed closed past the grace but the relay never gave up")
+            .expect("relay task panicked");
+        held.abort();
+    }
 }
