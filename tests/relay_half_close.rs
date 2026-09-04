@@ -12,6 +12,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod common;
+use crate::common::no_inherited_proxy;
+
 const RESPONSE_LEN: usize = 256 * 1024;
 const UPLOAD_LEN: usize = 16 * 1024 * 1024;
 
@@ -87,15 +90,11 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Everything here talks over loopback, so an ambient proxy in the developer's
-/// environment must not be inherited: the HTTP client honours `*_PROXY` and
-/// would try to reach 127.0.0.1 through it.
+/// Spawn tunnix without inheriting an ambient proxy - see `common`.
 fn spawn_direct(bin: &str, args: &[&str]) -> KillOnDrop {
     let mut cmd = Command::new(bin);
     cmd.args(args);
-    for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
-        cmd.env_remove(var);
-    }
+    no_inherited_proxy(&mut cmd);
     KillOnDrop(
         cmd.stdout(Stdio::null())
             .stderr(Stdio::null())

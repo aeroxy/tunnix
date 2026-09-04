@@ -5,6 +5,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod common;
+use crate::common::no_inherited_proxy;
+
 /// Find an available TCP port on localhost
 fn find_free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind");
@@ -72,15 +75,6 @@ password = ""
 "#,
     );
     std::fs::write(config_path, content).expect("failed to write config");
-}
-
-/// Everything here talks over loopback, so an ambient proxy in the developer's
-/// environment must not be inherited: the HTTP client honours `*_PROXY` and
-/// would try to reach 127.0.0.1 through it.
-fn no_inherited_proxy(cmd: &mut Command) {
-    for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
-        cmd.env_remove(var);
-    }
 }
 
 /// Wraps a Child process and kills it on drop
