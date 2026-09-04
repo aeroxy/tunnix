@@ -28,14 +28,20 @@ const CONN_CHANNEL_CAPACITY: usize = 256;
 /// dispatch loop, so an unbounded wait here starves every other connection on
 /// the tunnel.
 ///
-/// Must stay well under the server's per-message delivery budget in
-/// `send_to_client` (50 attempts x (500ms + 100ms) ~= 30s). Dispatch runs
-/// inline in the SSE read loop, so this is also how long the client can go
-/// without reading the SSE socket at all: at the same magnitude as that budget,
-/// one stalled consumer would let the server exhaust its retries on unrelated
-/// healthy connections and tear them down as unreachable. 5s is still ~20x what
-/// a draining 256-slot queue needs.
-const DISPATCH_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// This is a stopgap, not backpressure: a proxied app that simply stops
+/// reading for this long with a full queue (~8MB buffered) has its connection
+/// reset, where TCP would have made the target wait. Real per-connection
+/// backpressure needs flow control in the protocol; until then the value is a
+/// trade between tolerating a paused consumer and the constraint below.
+///
+/// It must stay well under the server's per-message delivery budget in
+/// `send_to_client` (30s of wall clock). Dispatch runs inline in the SSE read
+/// loop, so this is also how long the client can go without reading the SSE
+/// socket at all: at the same magnitude as that budget, one stalled consumer
+/// would let the server exhaust its retries on unrelated healthy connections
+/// and tear them down as unreachable. 15s leaves that budget a 2x margin, and
+/// is still far more than a draining 256-slot queue needs.
+const DISPATCH_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a stalled `Close` may wait off the dispatch loop before its
 /// connection is given up on. Generous where `DISPATCH_STALL_TIMEOUT` is tight:
 /// this wait blocks no other connection, and the alternative is resetting an
@@ -653,5 +659,47 @@ pub(crate) mod tests {
             matches!(rx.recv().await, Some(TunnelEvent::Close)),
             "the handed-off Close never arrived"
         );
+    }
+
+    /// The mirror of the stall test: a consumer that is slow but *does* make
+    /// progress inside the timeout must keep its connection. The stall test
+    /// only proves the bound fires; this one pins that it does not fire early,
+    /// which is what makes the timeout a bound on wedged consumers rather than
+    /// a penalty on merely slow ones. Time is paused, so the wait is instant.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_consumer_inside_the_stall_timeout_is_not_dropped() {
+        let tunnel = Arc::new(test_tunnel("pw"));
+        let mut rx = tunnel.register_connection(1).await;
+
+        // Fill the queue: the app has fallen behind.
+        let frame = sse_frame(&tunnel, &Message::Data { conn_id: 1, data: vec![3u8; 8] });
+        for _ in 0..CONN_CHANNEL_CAPACITY {
+            tunnel.handle_sse_message(&frame).await;
+        }
+
+        // One more has nowhere to go yet. Dispatch waits on it...
+        let dispatch = {
+            let tunnel = tunnel.clone();
+            let frame = frame.clone();
+            tokio::spawn(async move { tunnel.handle_sse_message(&frame).await })
+        };
+
+        // ...and the app frees a slot just inside the timeout.
+        tokio::time::sleep(DISPATCH_STALL_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!dispatch.is_finished(), "dispatch gave up before the timeout");
+        assert!(matches!(rx.recv().await, Some(TunnelEvent::Data(_))));
+
+        tokio::time::timeout(Duration::from_secs(600), dispatch)
+            .await
+            .expect("dispatch did not complete once a slot freed")
+            .unwrap();
+        assert!(
+            tunnel.response_channels.lock().await.contains_key(&1),
+            "a consumer that made progress inside the timeout was dropped"
+        );
+        // Everything queued, including the late one, is still there.
+        for _ in 0..CONN_CHANNEL_CAPACITY {
+            assert!(matches!(rx.try_recv(), Ok(TunnelEvent::Data(_))));
+        }
     }
 }
