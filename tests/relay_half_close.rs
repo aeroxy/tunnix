@@ -192,6 +192,13 @@ fn socks5_connect(proxy_port: u16, port: u16) -> TcpStream {
     let mut sock = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5))
         .expect("failed to connect to proxy");
     sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    // Bound writes too, not just reads. `test_upload_survives_target_output_eof`
+    // pushes UPLOAD_LEN through this socket, so a relay that stops draining its
+    // read half without closing the connection fills the socket buffer and
+    // parks `write_all` forever - a hung test run rather than a failed one,
+    // since cargo bounds neither. Applies per write syscall, so this trips only
+    // when the relay makes no progress at all for 30s.
+    sock.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
 
     sock.write_all(&[0x05, 0x01, 0x00]).expect("greeting failed");
     let mut greeting = [0u8; 2];
