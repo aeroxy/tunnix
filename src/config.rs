@@ -79,9 +79,17 @@ pub struct ClientConfig {
     #[serde(default)]
     pub headers: HashMap<String, String>,
 
-    /// Reconnect interval in seconds
+    /// Seconds to wait before reopening the SSE stream after a failure.
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval: u64,
+
+    /// Consecutive reconnect attempts that may fail to get any data from the
+    /// server before the client gives up and exits. Any stream that does
+    /// deliver data resets the count, so this bounds an unbroken run of
+    /// failures (server down, wrong URL), not reconnects over the tunnel's
+    /// lifetime. 0 = retry forever.
+    #[serde(default = "default_max_reconnect_attempts")]
+    pub max_reconnect_attempts: u32,
 
     /// Expected response body from server /health (default: "ok"). Connection fails if mismatch.
     #[serde(default = "default_health_expected")]
@@ -113,7 +121,11 @@ fn default_timeout() -> u64 {
 }
 
 fn default_reconnect_interval() -> u64 {
-    5
+    3
+}
+
+fn default_max_reconnect_attempts() -> u32 {
+    3
 }
 
 fn default_health_response() -> String {
@@ -153,6 +165,7 @@ impl Default for ClientConfig {
             local_addr: default_local_addr(),
             headers: HashMap::new(),
             reconnect_interval: default_reconnect_interval(),
+            max_reconnect_attempts: default_max_reconnect_attempts(),
             health_expected: default_health_expected(),
         }
     }

@@ -20,6 +20,10 @@ const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// that long under network congestion, and this also covers first-frame
 /// processing before sse_ready fires.
 const RECONNECT_WAIT: Duration = Duration::from_secs(20);
+/// Delay before reopening a stream that ended cleanly. Usually the server
+/// dropped our session (restart or eviction) and a fresh GET recreates it, so
+/// this is deliberately shorter than the configured post-error interval.
+const CLEAN_END_RETRY: Duration = Duration::from_secs(1);
 /// Per-connection event queue depth. Deep enough that a merely slow local app
 /// keeps draining without stalling dispatch.
 const CONN_CHANNEL_CAPACITY: usize = 256;
@@ -65,6 +69,11 @@ pub struct Tunnel {
     pub response_channels: Arc<Mutex<HashMap<u32, mpsc::Sender<TunnelEvent>>>>,
     pub reconnect_signal: Arc<Notify>,
     sse_ready: Arc<Notify>,
+    /// How long to wait before reopening the stream after a failure.
+    retry_interval: Duration,
+    /// Consecutive no-data attempts tolerated before the client exits; 0 =
+    /// retry forever. See the give-up branch in the reconnect loop.
+    max_reconnect_attempts: u32,
 }
 
 impl Tunnel {
@@ -74,6 +83,8 @@ impl Tunnel {
         crypto: Arc<Crypto>,
         headers: &HashMap<String, String>,
         health_expected: &str,
+        reconnect_interval: u64,
+        max_reconnect_attempts: u32,
     ) -> Result<Arc<Self>> {
         let session_id = format!("{:016x}", rand::random::<u64>());
 
@@ -92,6 +103,8 @@ impl Tunnel {
             response_channels: Arc::new(Mutex::new(HashMap::new())),
             reconnect_signal: Arc::new(Notify::new()),
             sse_ready: Arc::new(Notify::new()),
+            retry_interval: Duration::from_secs(reconnect_interval),
+            max_reconnect_attempts,
         });
 
         // Test connection with health check
@@ -127,19 +140,53 @@ impl Tunnel {
             // case signal on any event to avoid stalling `send_message`'s
             // retry for the full RECONNECT_WAIT timeout.
             let mut is_reconnect = false;
+            // Consecutive attempts that never got a byte out of the stream.
+            // Any stream that *did* deliver data resets this, so the budget
+            // bounds an unbroken run of failures (server down, wrong URL) and
+            // not reconnects over the tunnel's lifetime: a long-lived client
+            // legitimately reconnects many times as the server restarts or
+            // evicts its session, and must survive all of them.
+            let mut failures: u32 = 0;
             loop {
-                let res = tunnel_clone.sse_read_loop(is_reconnect).await;
+                let mut progress = false;
+                let res = tunnel_clone.sse_read_loop(is_reconnect, &mut progress).await;
                 is_reconnect = true;
-                match res {
-                    Err(e) if e.to_string().contains("forced reconnect") => continue,
-                    Err(e) => {
-                        error!("SSE stream error: {}, reconnecting in 3s...", e);
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    }
-                    Ok(()) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
+
+                // A forced reconnect is deliberate (config reload, or a send
+                // failure asking for a fresh stream), not a failure to reach
+                // the server: it neither counts nor waits.
+                if matches!(&res, Err(e) if e.to_string().contains("forced reconnect")) {
+                    continue;
                 }
+
+                if progress {
+                    failures = 0;
+                } else {
+                    failures += 1;
+                }
+
+                if let Err(e) = &res {
+                    error!("SSE stream error: {}", e);
+                }
+
+                let max = tunnel_clone.max_reconnect_attempts;
+                if max != 0 && failures >= max {
+                    // The reconnect task is the only thing holding the tunnel
+                    // up, so returning here would leave the proxy listening
+                    // and failing every connection. Exit loudly instead:
+                    // tracing writes straight to stderr/the log file, so
+                    // nothing buffered is lost.
+                    error!(
+                        "no data from the server across {} consecutive attempt(s); giving up. \
+                         Raise client.max_reconnect_attempts (0 = retry forever) to keep trying.",
+                        failures
+                    );
+                    std::process::exit(1);
+                }
+
+                let wait = if res.is_ok() { CLEAN_END_RETRY } else { tunnel_clone.retry_interval };
+                warn!("reconnecting in {:?} (consecutive failures: {})", wait, failures);
+                tokio::time::sleep(wait).await;
             }
         });
 
@@ -154,7 +201,9 @@ impl Tunnel {
     }
 
     /// Read SSE events and dispatch to connection handlers
-    async fn sse_read_loop(&self, is_reconnect: bool) -> Result<()> {
+    /// Sets `progress` once the stream has yielded a byte: proof the server is
+    /// alive and streaming, which is what clears the reconnect budget.
+    async fn sse_read_loop(&self, is_reconnect: bool, progress: &mut bool) -> Result<()> {
         let hot = self.hot.load();
         let sid = self.session_id.read().await;
         let url = format!("{}/stream/{}", hot.server_base_url, *sid);
@@ -216,7 +265,11 @@ impl Tunnel {
             tokio::select! {
                 chunk = tokio::time::timeout(Duration::from_secs(30), stream.next()) => {
                     let chunk = match chunk {
-                        Ok(Some(c)) => c?,
+                        Ok(Some(c)) => {
+                            let c = c?;
+                            *progress = true;
+                            c
+                        }
                         Ok(None) => break,
                         Err(_) => {
                             warn!("SSE read timeout, reconnecting");
@@ -499,6 +552,8 @@ pub(crate) mod tests {
             response_channels: Arc::new(Mutex::new(HashMap::new())),
             reconnect_signal: Arc::new(Notify::new()),
             sse_ready: Arc::new(Notify::new()),
+            retry_interval: Duration::from_secs(3),
+            max_reconnect_attempts: 3,
         }
     }
 

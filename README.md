@@ -215,6 +215,8 @@ password = "your-secret"
 server_url = "https://your-host.example.com"
 password = "your-secret"
 local_addr = "127.0.0.1:7890"
+# reconnect_interval = 3       # seconds to wait before reopening a failed stream
+# max_reconnect_attempts = 3   # consecutive no-data attempts before exiting; 0 = retry forever
 
 [client.headers]
 # Cookie = "..."   # only needed for cookie-authenticated hosts
@@ -242,7 +244,13 @@ This applies to every subcommand, including `push` / `pull` and `remote-exec` �
 
 CLI flags always override config file values. The password can also be supplied via the `TUNNIX_PASSWORD` environment variable.
 
-Changes to `config.toml` are picked up automatically every few seconds — no restart needed. Hot-reloadable fields: `password`, `headers`, `path_prefix`, `root_redirect`, `root_html`, `health_response`. Fields that require a restart: `listen`, `local_addr`, `server_url`, `logging.level`. CLI overrides are never clobbered by file changes.
+Changes to `config.toml` are picked up automatically every few seconds — no restart needed. Hot-reloadable fields: `password`, `headers`, `path_prefix`, `root_redirect`, `root_html`, `health_response`. Fields that require a restart: `listen`, `local_addr`, `server_url`, `logging.level`, `reconnect_interval`, `max_reconnect_attempts`. CLI overrides are never clobbered by file changes.
+
+### When the server goes away
+
+The client reopens the SSE stream on its own, waiting `reconnect_interval` seconds between tries. After `max_reconnect_attempts` consecutive attempts that get no data from the server it logs the reason and exits non-zero, rather than retrying forever behind a proxy port that fails every connection - so a supervisor (systemd, launchd, a shell loop) can decide what to do about it. Any stream that does deliver data resets the count, so ordinary reconnects across a server restart never accumulate toward it. Set `max_reconnect_attempts = 0` to retry forever.
+
+Note the initial connection is not retried at all: if the server is unreachable when the client starts, the health check fails and it exits immediately.
 
 ## Building
 
