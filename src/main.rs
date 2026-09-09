@@ -94,6 +94,10 @@ struct ClientArgs {
     /// Custom cookie header (overrides config)
     #[arg(short, long)]
     cookie: Option<String>,
+
+    /// Consecutive failed reconnects before giving up (0 = retry forever)
+    #[arg(long)]
+    max_reconnect_attempts: Option<u32>,
 }
 
 #[cfg(unix)]
@@ -310,6 +314,9 @@ async fn main() -> Result<()> {
             if let Some(local_addr) = ca.local_addr {
                 config.client.local_addr = local_addr;
             }
+            if let Some(max) = ca.max_reconnect_attempts {
+                config.client.max_reconnect_attempts = max;
+            }
             if let Some(cookie) = ca.cookie {
                 config.client.headers.insert("Cookie".to_string(), cookie);
             }
@@ -342,6 +349,8 @@ async fn main() -> Result<()> {
                 crypto,
                 &config.client.headers,
                 &config.client.health_expected,
+                config.client.reconnect_interval,
+                config.client.max_reconnect_attempts,
             )
             .await?;
 
@@ -394,6 +403,8 @@ async fn main() -> Result<()> {
                 crypto,
                 &config.client.headers,
                 &config.client.health_expected,
+                config.client.reconnect_interval,
+                config.client.max_reconnect_attempts,
             )
             .await?;
 
@@ -479,6 +490,8 @@ async fn connect_transfer_tunnel(
         crypto,
         &config.client.headers,
         &config.client.health_expected,
+        config.client.reconnect_interval,
+        config.client.max_reconnect_attempts,
     )
     .await
 }

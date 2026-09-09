@@ -1078,9 +1078,10 @@ async fn relay_pty_connection(
 /// relays treat the client as gone.
 ///
 /// A trade between two costs. Too short, and a client that is merely slow to
-/// reconnect loses its idle connections: its reconnect is a fixed 3s sleep
-/// plus a GET that can take several seconds through a reverse proxy, and 6s
-/// cleared the sleep with little to spare. Too long, and a client that really
+/// reconnect loses its idle connections: its reconnect is a sleep of
+/// `client.reconnect_interval` (3s by default) plus a GET that can take
+/// several seconds through a reverse proxy, and 6s cleared the sleep with
+/// little to spare. Too long, and a client that really
 /// is gone keeps its PTY children running and its target sockets held for the
 /// whole wait. 10s leaves the GET 7s and still reaps within seconds.
 ///
@@ -1152,8 +1153,10 @@ const SEND_ATTEMPTS: u32 = 50;
 /// than to a fixed backoff: a *full* channel (client stalled) costs the 500ms
 /// send timeout, but a *closed* one (client mid-reconnect) fails instantly, and
 /// pacing by attempt count alone gave a reconnecting client 50 x 100ms = 5s
-/// against a stalled client's 30s. The client's reconnect is a 3s sleep plus a
-/// GET, so 5s was tearing down healthy connections across ordinary reconnects.
+/// against a stalled client's 30s. The client's reconnect is a sleep of
+/// `client.reconnect_interval` (3s by default) plus a GET, so 5s was tearing
+/// down healthy connections across ordinary reconnects. A client configured
+/// with a much larger interval trades that margin away.
 const SEND_ATTEMPT_INTERVAL: Duration = Duration::from_millis(600);
 
 /// `send_to_client` with an explicit attempt budget. Only teardown paths that
