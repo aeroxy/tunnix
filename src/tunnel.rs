@@ -20,6 +20,10 @@ const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// that long under network congestion, and this also covers first-frame
 /// processing before sse_ready fires.
 const RECONNECT_WAIT: Duration = Duration::from_secs(20);
+/// How long the client waits for any byte on the SSE stream before declaring
+/// it dead. The server sends a keepalive comment every 15s, so this tolerates
+/// one missed keepalive before giving up on the connection.
+const SSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay before reopening a stream that ended cleanly. Usually the server
 /// dropped our session (restart or eviction) and a fresh GET recreates it, so
 /// this is deliberately shorter than the configured post-error interval.
@@ -263,7 +267,7 @@ impl Tunnel {
 
         loop {
             tokio::select! {
-                chunk = tokio::time::timeout(Duration::from_secs(30), stream.next()) => {
+                chunk = tokio::time::timeout(SSE_READ_TIMEOUT, stream.next()) => {
                     let chunk = match chunk {
                         Ok(Some(c)) => {
                             let c = c?;
@@ -271,10 +275,12 @@ impl Tunnel {
                             c
                         }
                         Ok(None) => break,
-                        Err(_) => {
-                            warn!("SSE read timeout, reconnecting");
-                            break;
-                        }
+                        // Not a clean end: the server owes us a keepalive
+                        // every 15s, so silence this long is a failure. Break
+                        // here and the outer loop would read it as a dropped
+                        // session and retry after CLEAN_END_RETRY instead of
+                        // backing off by the configured interval.
+                        Err(_) => anyhow::bail!("no data on the SSE stream for {:?}", SSE_READ_TIMEOUT),
                     };
                     let text = String::from_utf8_lossy(&chunk);
                     buffer.push_str(&text);
