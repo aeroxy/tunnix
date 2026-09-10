@@ -142,13 +142,19 @@ fn spawn_client(bin: &str, config: &Path, log: &Path) -> Child {
         .expect("failed to start client")
 }
 
-fn write_client_config(path: &Path, server_port: u16, proxy_port: u16, max_attempts: u32) {
+fn write_client_config(
+    path: &Path,
+    server_port: u16,
+    proxy_port: u16,
+    interval: u64,
+    max_attempts: u32,
+) {
     let content = format!(
         r#"[client]
 server_url = "http://127.0.0.1:{server_port}"
 local_addr = "127.0.0.1:{proxy_port}"
 password = ""
-reconnect_interval = 1
+reconnect_interval = {interval}
 max_reconnect_attempts = {max_attempts}
 "#,
     );
@@ -178,7 +184,7 @@ fn test_client_exits_after_max_reconnect_attempts() {
 
     let port = find_free_port();
     let proxy_port = find_free_port();
-    write_client_config(&config_path, port, proxy_port, 2);
+    write_client_config(&config_path, port, proxy_port, 1, 2);
 
     let server = spawn_server(bin, &server_config, port);
     assert!(wait_for_server(port, 10_000), "server did not become ready");
@@ -205,7 +211,14 @@ fn test_client_exits_after_max_reconnect_attempts() {
         }
     };
 
-    assert!(!status.success(), "expected a failure exit, got {:?}", status);
+    // Exactly 1: `!success()` would also accept a panic or a signal kill.
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected a clean exit(1), got {:?}:\n{}",
+        status,
+        log
+    );
     assert!(
         log.contains("giving up"),
         "expected the give-up reason in the log:\n{}",
@@ -228,7 +241,7 @@ fn test_healthy_reconnect_resets_the_budget() {
 
     let port = find_free_port();
     let proxy_port = find_free_port();
-    write_client_config(&config_path, port, proxy_port, 3);
+    write_client_config(&config_path, port, proxy_port, 2, 3);
 
     let server = spawn_server(bin, &server_config, port);
     assert!(wait_for_server(port, 10_000), "server did not become ready");
@@ -248,6 +261,20 @@ fn test_healthy_reconnect_resets_the_budget() {
     let mut current = Some(server);
     for bounce in 1..=4 {
         drop(current.take());
+
+        // Wait for the client to actually notice, and to say that the stream
+        // it lost had delivered data. "SSE stream connected" would not do: it
+        // is logged as soon as the GET returns headers, before a single byte
+        // is read, so it cannot tell a stream that carried a Reset frame from
+        // one that merely opened. Only a zeroed count proves `progress` was
+        // set - a run of dead attempts logs 1, 2, 3 instead.
+        assert!(
+            wait_for_log_count(&log_path, "consecutive failures: 0", bounce, 20_000),
+            "bounce {} broke a stream that had never delivered data:\n{}",
+            bounce,
+            read_log(&log_path)
+        );
+
         current = Some(spawn_server(bin, &server_config, port));
         assert!(
             wait_for_server(port, 10_000),
@@ -273,7 +300,13 @@ fn test_healthy_reconnect_resets_the_budget() {
     let status = wait_for_exit(&mut client, 30_000);
     let log = read_log(&log_path);
     match status {
-        Some(s) => assert!(!s.success(), "expected a failure exit, got {:?}", s),
+        Some(s) => assert_eq!(
+            s.code(),
+            Some(1),
+            "expected a clean exit(1), got {:?}:\n{}",
+            s,
+            log
+        ),
         None => {
             let _ = client.kill();
             panic!("client kept retrying instead of giving up:\n{}", log);

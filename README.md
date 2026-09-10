@@ -248,7 +248,7 @@ Changes to `config.toml` are picked up automatically every few seconds — no re
 
 ### When the server goes away
 
-The client reopens the SSE stream on its own, waiting `reconnect_interval` seconds between tries. After `max_reconnect_attempts` consecutive attempts that get no data from the server it logs the reason and exits non-zero, rather than retrying forever behind a proxy port that fails every connection - so a supervisor (systemd, launchd, a shell loop) can decide what to do about it. Any stream that does deliver data resets the count, so ordinary reconnects across a server restart never accumulate toward it. Set `max_reconnect_attempts = 0` to retry forever.
+The client reopens the SSE stream on its own, waiting `reconnect_interval` seconds after a failed attempt - or a fixed 1s after a stream that ended cleanly, which usually just means the server dropped the session and a fresh GET will recreate it. After `max_reconnect_attempts` consecutive attempts that get no data from the server it logs the reason and exits non-zero, rather than retrying forever behind a proxy port that fails every connection - so a supervisor (systemd, launchd, a shell loop) can decide what to do about it. Any stream that does deliver data resets the count, so ordinary reconnects across a server restart never accumulate toward it. Set `max_reconnect_attempts = 0` to retry forever.
 
 Note the initial connection is not retried at all: if the server is unreachable when the client starts, the health check fails and it exits immediately.
 
