@@ -1,6 +1,6 @@
 [package]
 name = "tunnix"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 # Floor of the locked dependency tree (cookie_store 0.22 declares 1.88; tokio
 # 1.51, pulled in for TcpStream::set_zero_linger, needs 1.71). Lets cargo report
